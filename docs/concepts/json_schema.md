@@ -1285,6 +1285,39 @@ print(json.dumps(json_schema, indent=2))
 """
 ```
 
+## JSON Schema dialects
+
+By default, schemas are generated for the [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/schema)
+dialect. If your downstream tooling only supports [JSON Schema Draft 7](http://json-schema.org/draft-07/schema#),
+you can explicitly select that dialect using the `schema_dialect` argument, available on
+[`BaseModel.model_json_schema`][pydantic.BaseModel.model_json_schema],
+[`TypeAdapter.json_schema`][pydantic.TypeAdapter.json_schema], and the other schema generation entry points:
+
+```python
+from pydantic import BaseModel
+from pydantic.json_schema import DRAFT_07_SCHEMA_DIALECT
+
+
+class Model(BaseModel):
+    x: tuple[int, str]
+
+
+schema = Model.model_json_schema(schema_dialect=DRAFT_07_SCHEMA_DIALECT)
+assert schema['$schema'] == 'http://json-schema.org/draft-07/schema#'
+# `prefixItems` is rewritten as the array form of `items`, as Draft 7 expects:
+assert schema['properties']['x']['items'] == [{'type': 'integer'}, {'type': 'string'}]
+```
+
+When the Draft 7 dialect is selected, the generated schema is converted to be compatible with Draft 7
+validators: `$defs` is renamed to `definitions` (with `$ref` values rewritten accordingly, including
+inside nested definitions), `prefixItems` becomes the array form of `items` (with any schema for extra
+tuple items moved to `additionalItems`), and `$ref`s with adjacent keywords are wrapped in `allOf`.
+
+The conversion never silently weakens the schema: if a keyword is encountered that cannot be
+equivalently expressed in Draft 7 (e.g. `unevaluatedProperties`), a
+[`PydanticInvalidForJsonSchema`][pydantic.errors.PydanticInvalidForJsonSchema] error is raised,
+reporting the path and the offending keyword.
+
 ## Customizing the `$ref`s in JSON Schema
 
 The format of `$ref`s can be altered by calling [`model_json_schema()`][pydantic.main.BaseModel.model_json_schema]

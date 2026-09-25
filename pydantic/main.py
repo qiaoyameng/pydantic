@@ -612,6 +612,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         mode: JsonSchemaMode = 'validation',
         *,
         union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
+        schema_dialect: str | None = None,
     ) -> Dict[str, Any]:  # noqa: UP006
         """Generates a JSON schema for a model class.
 
@@ -629,6 +630,9 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             schema_generator: To override the logic used to generate the JSON schema, as a subclass of
                 `GenerateJsonSchema` with your desired modifications
             mode: The mode in which to generate the schema.
+            schema_dialect: The JSON schema dialect to generate the schema for. Defaults to Draft 2020-12.
+                Set to `'http://json-schema.org/draft-07/schema#'` to generate a schema compatible with
+                JSON Schema Draft 7 validators.
 
         Returns:
             The JSON schema for the given model class.
@@ -640,6 +644,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             union_format=union_format,
             schema_generator=schema_generator,
             mode=mode,
+            schema_dialect=schema_dialect,
         )
 
     @classmethod

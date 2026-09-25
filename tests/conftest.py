@@ -177,16 +177,21 @@ def validate_json_schemas(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
     if sys.platform != 'emscripten':
         # Until https://github.com/pyodide/pyodide/issues/6234 is fixed:
 
-        from jsonschema import Draft202012Validator, SchemaError
+        from jsonschema import Draft7Validator, Draft202012Validator, SchemaError
 
         def generate(*args: Any, **kwargs: Any) -> Any:
             json_schema = orig_generate(*args, **kwargs)
             if not request.node.get_closest_marker('skip_json_schema_validation'):
+                validator = (
+                    Draft7Validator
+                    if json_schema.get('$schema') == 'http://json-schema.org/draft-07/schema#'
+                    else Draft202012Validator
+                )
                 try:
-                    Draft202012Validator.check_schema(json_schema)
+                    validator.check_schema(json_schema)
                 except SchemaError:
                     pytest.fail(
-                        'Failed to validate the JSON Schema against the Draft 2020-12 spec. '
+                        f'Failed to validate the JSON Schema against the {validator.__name__} spec. '
                         'If this is expected, you can mark the test function with the `skip_json_schema_validation` '
                         'marker. Note that this validation only takes place during tests, and is not active at runtime.'
                     )

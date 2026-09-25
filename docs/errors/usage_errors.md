@@ -1394,3 +1394,24 @@ try:
 except PydanticUserError as exc_info:
     assert exc_info.code == 'validate-by-alias-and-name-false'
 ```
+
+## Unsupported JSON Schema dialect {#invalid-json-schema-dialect}
+
+This error is raised when an unsupported JSON Schema dialect is requested during JSON Schema generation.
+
+The supported dialects are [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/schema)
+(the default) and [JSON Schema Draft 7](http://json-schema.org/draft-07/schema#).
+
+```python
+from pydantic import BaseModel, PydanticUserError
+
+
+class Model(BaseModel):
+    a: int
+
+
+try:
+    Model.model_json_schema(schema_dialect='https://json-schema.org/draft/2019-09/schema')
+except PydanticUserError as exc_info:
+    assert exc_info.code == 'invalid-json-schema-dialect'
+```
