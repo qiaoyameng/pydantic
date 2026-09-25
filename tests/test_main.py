@@ -48,7 +48,9 @@ from pydantic import (
     computed_field,
     constr,
     field_validator,
+    rebuild_models,
 )
+from pydantic._internal import _model_construction
 from pydantic._internal._generate_schema import GenerateSchema
 from pydantic._internal._mock_val_ser import MockCoreSchema
 from pydantic.dataclasses import dataclass as pydantic_dataclass
@@ -2663,6 +2665,154 @@ def test_model_rebuild_zero_depth():
 
     m = Model(x=42)
     assert m.model_dump() == {'x': 42}
+
+
+def test_rebuild_models_rebinds_types_for_mutually_dependent_models():
+    class NodeV1(BaseModel):
+        tag: int = 0
+
+    class NodeV2(BaseModel):
+        tag: str = ''
+
+    class A(BaseModel):
+        x: 'NodeAlias'  # noqa: F821
+        b: 'B'
+
+    class B(BaseModel):
+        a: Optional['A'] = None
+
+    assert not A.__pydantic_complete__
+    assert not B.__pydantic_complete__
+
+    assert rebuild_models([A, B], types_namespace={'NodeAlias': NodeV1, 'B': B}) is True
+
+    a = A(x={'tag': 1}, b={})
+    assert isinstance(a.x, NodeV1)
+    assert A.model_json_schema()['$defs']['NodeV1']['properties']['tag']['type'] == 'integer'
+
+    # Simulate a plugin rebinding the type name to a different type; the mutually
+    # dependent models are rebuilt together against the new binding:
+    assert rebuild_models([A, B], types_namespace={'NodeAlias': NodeV2, 'B': B}) is True
+
+    a = A(x={'tag': 'hello'}, b={'a': None})
+    assert isinstance(a.x, NodeV2)
+    assert isinstance(a.b, B)
+    assert a.model_dump() == {'x': {'tag': 'hello'}, 'b': {'a': None}}
+    assert A.model_json_schema()['$defs']['NodeV2']['properties']['tag']['type'] == 'string'
+
+
+def test_rebuild_models_rebuilds_dependency_closure():
+    class LeafV1(BaseModel):
+        t: int = 0
+
+    class LeafV2(BaseModel):
+        t: str = ''
+
+    class Mid(BaseModel):
+        leaf: 'LeafAlias'  # noqa: F821
+
+    class Root(BaseModel):
+        mid: Mid
+
+    # Only the root model is provided; `Mid` is part of the dependency closure
+    # and is rebuilt (and reevaluated against the types namespace) as well:
+    assert rebuild_models([Root], types_namespace={'LeafAlias': LeafV1}) is True
+    assert isinstance(Root(mid={'leaf': {}}).mid.leaf, LeafV1)
+
+    assert rebuild_models([Root], types_namespace={'LeafAlias': LeafV2}) is True
+    assert isinstance(Root(mid={'leaf': {'t': 'x'}}).mid.leaf, LeafV2)
+
+
+def test_rebuild_models_failure_keeps_previous_state():
+    class NodeV1(BaseModel):
+        tag: int = 0
+
+    class NodeV2(BaseModel):
+        tag: str = ''
+
+    class A(BaseModel):
+        x: 'NodeAlias'  # noqa: F821
+        b: 'B'
+
+    class B(BaseModel):
+        a: Optional['A'] = None
+
+    class Broken(BaseModel):
+        y: 'Missing'  # noqa: F821
+
+    assert rebuild_models([A, B], types_namespace={'NodeAlias': NodeV1, 'B': B}) is True
+    old_a_validator = A.__pydantic_validator__
+    old_b_validator = B.__pydantic_validator__
+
+    # The reference in `Broken` cannot be resolved; the whole group must be left
+    # in its previous (usable) state, with no model partially rebuilt:
+    with pytest.raises(PydanticUndefinedAnnotation, match="name 'Missing' is not defined"):
+        rebuild_models([A, B, Broken], types_namespace={'NodeAlias': NodeV2, 'B': B})
+
+    assert A.__pydantic_complete__
+    assert B.__pydantic_complete__
+    assert not Broken.__pydantic_complete__
+    assert A.__pydantic_validator__ is old_a_validator
+    assert B.__pydantic_validator__ is old_b_validator
+    assert isinstance(A(x={'tag': 1}, b={}).x, NodeV1)
+
+    # Same behavior with `raise_errors=False`:
+    assert rebuild_models([A, Broken], types_namespace={'NodeAlias': NodeV2, 'B': B}, raise_errors=False) is False
+    assert A.__pydantic_validator__ is old_a_validator
+    assert isinstance(A(x={'tag': 1}, b={}).x, NodeV1)
+
+
+def test_rebuild_models_existing_type_adapter_keeps_old_snapshot():
+    class NodeV1(BaseModel):
+        tag: int = 0
+
+    class NodeV2(BaseModel):
+        tag: str = ''
+
+    class A(BaseModel):
+        x: 'NodeAlias'  # noqa: F821
+        b: 'B'
+
+    class B(BaseModel):
+        a: Optional['A'] = None
+
+    rebuild_models([A, B], types_namespace={'NodeAlias': NodeV1, 'B': B})
+
+    adapter = TypeAdapter(A)
+
+    rebuild_models([A, B], types_namespace={'NodeAlias': NodeV2, 'B': B})
+
+    # The existing adapter captured the old core schema/validator/serializer:
+    assert isinstance(adapter.validate_python({'x': {'tag': 1}, 'b': {}}).x, NodeV1)
+    # Adapters created after the rebuild see the new state:
+    assert isinstance(TypeAdapter(A).validate_python({'x': {'tag': 's'}, 'b': {}}).x, NodeV2)
+
+
+def test_rebuild_models_duplicates_and_cycles_not_published_twice(mocker):
+    class A(BaseModel):
+        b: Optional['B'] = None
+        c: Optional['C'] = None
+
+    class B(BaseModel):
+        a: Optional['A'] = None
+
+    class C(BaseModel):
+        c: Optional['C'] = None
+
+    spy = mocker.spy(_model_construction, 'create_schema_validator')
+
+    assert rebuild_models([A, B, A, B], types_namespace={'B': B, 'C': C}) is True
+
+    rebuilt = [call.args[1] for call in spy.call_args_list]
+    assert sorted(rebuilt, key=lambda cls: cls.__name__) == [A, B, C]
+
+
+def test_rebuild_models_invalid_input():
+    class A(BaseModel):
+        x: int
+
+    with pytest.raises(TypeError, match='`rebuild_models\\(\\)` expects `BaseModel` subclasses'):
+        rebuild_models([A, int])
 
 
 @pytest.fixture(scope='session', name='InnerEqualityModel')

@@ -586,10 +586,20 @@ def rebuild_model_fields(
     config_wrapper: ConfigWrapper,
     ns_resolver: NsResolver,
     typevars_map: Mapping[TypeVar, Any],
+    force_reevaluate: bool = False,
 ) -> tuple[dict[str, FieldInfo], PydanticExtraInfo | None]:
     """Rebuild the (already present) model fields by trying to reevaluate annotations.
 
     This function should be called whenever a model with incomplete fields is encountered.
+
+    Args:
+        cls: The model class to rebuild the fields for.
+        config_wrapper: The config wrapper instance.
+        ns_resolver: The namespace resolver instance to use during annotation evaluation.
+        typevars_map: A dictionary mapping type variables to their concrete types.
+        force_reevaluate: Whether to reevaluate the annotations of *all* fields from their
+            original (unevaluated) form, even if they are already complete. This is useful
+            when names in the types namespace were rebound to different types.
 
     Returns:
         A two-tuple, the first element being the rebuilt fields, the second element being
@@ -605,16 +615,25 @@ def rebuild_model_fields(
     rebuilt_fields: dict[str, FieldInfo] = {}
     with ns_resolver.push(cls):
         for f_name, field_info in cls.__pydantic_fields__.items():
-            if field_info._complete:
+            if field_info._complete and not force_reevaluate:
+                rebuilt_fields[f_name] = field_info
+            elif field_info._original_annotation is PydanticUndefined:
+                # The original (unevaluated) annotation is not available, the field
+                # can't be recreated; keep it as is:
                 rebuilt_fields[f_name] = field_info
             else:
                 new_field = _recreate_field_info(
                     field_info, ns_resolver=ns_resolver, typevars_map=typevars_map, lenient=False
                 )
+                if force_reevaluate:
+                    # Keep the original (unevaluated) annotation, so that subsequent rebuilds
+                    # reevaluate it as well (e.g. if names in the types namespace are rebound
+                    # to different types again):
+                    new_field._original_annotation = field_info._original_annotation
                 update_field_from_config(config_wrapper, f_name, new_field)
                 rebuilt_fields[f_name] = new_field
 
-        if cls.__pydantic_extra_info__ is not None and not cls.__pydantic_extra_info__.complete:
+        if cls.__pydantic_extra_info__ is not None and (force_reevaluate or not cls.__pydantic_extra_info__.complete):
             # Not the best pattern (see comment in `_recreate_field_info()`):
             ann = _typing_extra.eval_type(
                 cls.__pydantic_extra_info__.annotation,
