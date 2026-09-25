@@ -8,7 +8,7 @@ import typing
 import warnings
 import weakref
 from abc import ABCMeta
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from functools import cache, partial, wraps
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Generic, Literal, NoReturn, TypeVar, cast
@@ -31,14 +31,15 @@ from ._fields import (
     is_valid_field_name,
     is_valid_privateattr_name,
     rebuild_model_fields,
+    reevaluate_model_fields,
 )
 from ._generate_schema import GenerateSchema, InvalidSchemaError
 from ._generics import PydanticGenericMetadata, get_model_typevars_map
 from ._import_utils import import_cached_base_model, import_cached_field_info
 from ._mock_val_ser import set_model_mocks
-from ._namespace_utils import NsResolver
+from ._namespace_utils import MappingNamespace, NsResolver
 from ._signature import generate_pydantic_signature
-from ._typing_extra import parent_frame_namespace
+from ._typing_extra import eval_type, parent_frame_namespace
 from ._utils import LazyClassAttribute, SafeGetItemProxy
 
 if TYPE_CHECKING:
@@ -678,6 +679,244 @@ def complete_model_class(
 
     if call_on_complete_hook:
         cls.__pydantic_on_complete__()
+
+    return True
+
+
+class _ModelRebuildPreparation(typing.NamedTuple):
+    """Everything necessary to rebuild a single model, as computed by `_prepare_models_rebuild()`."""
+
+    config_wrapper: ConfigWrapper
+    ns_resolver: NsResolver
+    typevars_map: dict[Any, Any]
+    fields: dict[str, FieldInfo]
+    extra_info: PydanticExtraInfo | None
+    was_complete: bool
+
+
+# Model class attributes that are (re)assigned during a group rebuild. They are saved upfront
+# so that the pre-rebuild state can be restored if any model fails to rebuild:
+_REBUILD_MODEL_ATTRS = (
+    '__pydantic_fields__',
+    '__pydantic_extra_info__',
+    '__pydantic_core_schema__',
+    '__pydantic_validator__',
+    '__pydantic_serializer__',
+    '__pydantic_computed_fields__',
+    '__pydantic_complete__',
+    '__signature__',
+)
+
+
+def _iter_model_classes(annotation: Any, _seen: set[int]) -> Iterator[type[BaseModel]]:
+    """Yield the `BaseModel` subclasses referenced by an annotation (including nested ones)."""
+    if id(annotation) in _seen:
+        return
+    _seen.add(id(annotation))
+    BaseModel_ = import_cached_base_model()
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel_):
+        if annotation is BaseModel_:
+            return
+        yield annotation
+        # For parametrized generic models, also look at the concrete type arguments:
+        generic_metadata = getattr(annotation, '__pydantic_generic_metadata__', None)
+        if generic_metadata is not None:
+            for arg in generic_metadata['args']:
+                yield from _iter_model_classes(arg, _seen)
+        return
+    for arg in typing.get_args(annotation):
+        yield from _iter_model_classes(arg, _seen)
+
+
+def _prepare_models_rebuild(
+    roots: list[type[BaseModel]],
+    types_namespace: MappingNamespace | None,
+) -> dict[type[BaseModel], _ModelRebuildPreparation]:
+    """Compute the dependency closure of `roots` and re-evaluate the fields of every involved model.
+
+    For every model in the closure, field annotations are re-evaluated from their raw form against
+    `types_namespace` (which takes precedence over the namespace captured when the model was defined,
+    so that externally rebound names are picked up). Models referenced -- directly or transitively --
+    in field, extra and computed field annotations are included in the closure.
+
+    This function does not mutate any model; if an annotation fails to resolve, a
+    `PydanticUndefinedAnnotation` error is raised and every model is left untouched.
+    """
+    prepared: dict[type[BaseModel], _ModelRebuildPreparation] = {}
+    seen_annotations: set[int] = set()
+    stack = list(roots)
+    while stack:
+        cls = stack.pop()
+        if cls in prepared:
+            continue
+
+        config_wrapper = ConfigWrapper(cls.model_config, check=False)
+        parent_ns = unpack_lenient_weakvaluedict(cls.__pydantic_parent_namespace__) or {}
+        if types_namespace is not None:
+            # Unlike `BaseModel.model_rebuild()`, the explicitly provided namespace takes
+            # precedence over the parent namespace captured when the model was defined:
+            parent_ns = {**parent_ns, **types_namespace}
+        ns_resolver = NsResolver(parent_namespace=parent_ns)
+        typevars_map = get_model_typevars_map(cls)
+
+        try:
+            fields, extra_info = reevaluate_model_fields(
+                cls,
+                config_wrapper=config_wrapper,
+                ns_resolver=ns_resolver,
+                typevars_map=typevars_map,
+            )
+        except NameError as e:
+            raise PydanticUndefinedAnnotation.from_name_error(e) from e
+
+        prepared[cls] = _ModelRebuildPreparation(
+            config_wrapper=config_wrapper,
+            ns_resolver=ns_resolver,
+            typevars_map=typevars_map,
+            fields=fields,
+            extra_info=extra_info,
+            was_complete=cls.__pydantic_complete__,
+        )
+
+        annotations: list[Any] = [f.annotation for f in fields.values()]
+        if extra_info is not None:
+            annotations.append(extra_info.annotation)
+        for computed_field in cls.__pydantic_decorators__.computed_fields.values():
+            return_type = computed_field.info.return_type
+            if return_type is PydanticUndefined:
+                continue
+            if isinstance(return_type, str):
+                # Best effort, only used to discover referenced models. If it can't be
+                # evaluated, the failure will surface during core schema generation:
+                try:
+                    with ns_resolver.push(cls):
+                        return_type = eval_type(return_type, *ns_resolver.types_namespace)
+                except Exception:
+                    continue
+            annotations.append(return_type)
+
+        for annotation in annotations:
+            stack.extend(m for m in _iter_model_classes(annotation, seen_annotations) if m not in prepared)
+
+    return prepared
+
+
+def rebuild_models(
+    models: Iterable[type[BaseModel]],
+    *,
+    types_namespace: MappingNamespace | None = None,
+    raise_errors: bool = True,
+) -> bool:
+    """Rebuild a group of models in a single, atomic operation.
+
+    The dependency closure of `models` is computed and every involved model has its fields
+    re-evaluated against `types_namespace` and its core schema regenerated. Only when *all*
+    the candidate schemas are successfully built is the new state (validator, serializer and
+    core schema -- as used for JSON Schema generation) published on each model. If any model
+    fails to rebuild, the whole group is left in its pre-rebuild (usable) state.
+
+    This must be called with the `_rebuild_lock` held (see `pydantic.rebuild_models()`).
+
+    Returns:
+        `True` if the rebuild succeeded, `False` if it failed and `raise_errors` is `False`.
+    """
+    roots = list(dict.fromkeys(models))
+    if not roots:
+        return True
+
+    try:
+        prepared = _prepare_models_rebuild(roots, types_namespace)
+    except Exception:
+        if raise_errors:
+            raise
+        return False
+
+    # Snapshot the current state of every involved model, so that it can be restored
+    # if anything goes wrong from this point (`PydanticUndefined` marks absent attributes):
+    snapshots: dict[type[BaseModel], dict[str, Any]] = {}
+    for cls, prep in prepared.items():
+        snapshot = {attr: cls.__dict__.get(attr, PydanticUndefined) for attr in _REBUILD_MODEL_ATTRS}
+        # `set_deprecated_descriptors()` (called when publishing) assigns class attributes
+        # named after the deprecated fields, save them as well:
+        for f_name, field_info in prep.fields.items():
+            if field_info.deprecation_message is not None and f_name not in snapshot:
+                snapshot[f_name] = cls.__dict__.get(f_name, PydanticUndefined)
+        for cf_name, computed_field in cls.__pydantic_decorators__.computed_fields.items():
+            if computed_field.info.deprecation_message is not None and cf_name not in snapshot:
+                snapshot[cf_name] = cls.__dict__.get(cf_name, PydanticUndefined)
+        snapshots[cls] = snapshot
+
+    try:
+        # Swap in the re-evaluated fields and reset the schema related attributes to mocks,
+        # so that nested references to models of the group don't reuse their stale schema
+        # during core schema generation:
+        for cls, prep in prepared.items():
+            cls.__pydantic_complete__ = False
+            set_model_mocks(cls)
+            cls.__pydantic_fields__ = prep.fields
+            cls.__pydantic_extra_info__ = prep.extra_info
+
+        # Build the candidate core schemas, validators and serializers, without publishing
+        # anything yet:
+        candidates: dict[type[BaseModel], tuple[Any, Any, Any]] = {}
+        for cls, prep in prepared.items():
+            gen_schema = GenerateSchema(
+                prep.config_wrapper,
+                prep.ns_resolver,
+                prep.typevars_map,
+            )
+            schema = gen_schema.generate_schema(cls)
+            core_config = prep.config_wrapper.core_config(title=cls.__name__)
+            schema = gen_schema.clean_schema(schema)
+            validator = create_schema_validator(
+                schema,
+                cls,
+                cls.__module__,
+                cls.__qualname__,
+                'BaseModel',
+                core_config,
+                prep.config_wrapper.plugin_settings,
+                _use_prebuilt=False,
+            )
+            serializer = SchemaSerializer(schema, core_config, _use_prebuilt=False)
+            candidates[cls] = (schema, validator, serializer)
+
+        # Everything succeeded, publish the new state on every model at once:
+        for cls, prep in prepared.items():
+            schema, validator, serializer = candidates[cls]
+            cls.__pydantic_computed_fields__ = {
+                k: v.info for k, v in cls.__pydantic_decorators__.computed_fields.items()
+            }
+            set_deprecated_descriptors(cls)
+            cls.__pydantic_core_schema__ = schema
+            cls.__pydantic_validator__ = validator
+            cls.__pydantic_serializer__ = serializer
+            cls.__signature__ = LazyClassAttribute(
+                '__signature__',
+                partial(
+                    generate_pydantic_signature,
+                    init=cls.__init__,
+                    fields=cls.__pydantic_fields__,
+                    validate_by_alias=prep.config_wrapper.validate_by_alias,
+                    extra=prep.config_wrapper.extra,
+                ),
+            )
+            cls.__pydantic_complete__ = True
+
+        for cls, prep in prepared.items():
+            if not prep.was_complete:
+                cls.__pydantic_on_complete__()
+    except Exception:
+        for cls, snapshot in snapshots.items():
+            for attr, value in snapshot.items():
+                if value is PydanticUndefined:
+                    if attr in cls.__dict__:
+                        delattr(cls, attr)
+                else:
+                    setattr(cls, attr, value)
+        if raise_errors:
+            raise
+        return False
 
     return True
 

@@ -679,6 +679,88 @@ def _recreate_field_info(
     return new_field
 
 
+def reevaluate_model_fields(
+    cls: type[BaseModel],
+    *,
+    config_wrapper: ConfigWrapper,
+    ns_resolver: NsResolver,
+    typevars_map: Mapping[TypeVar, Any],
+) -> tuple[dict[str, FieldInfo], PydanticExtraInfo | None]:
+    """Re-evaluate all the model fields from their raw (unevaluated) annotations.
+
+    Unlike `rebuild_model_fields()` -- which only re-evaluates *incomplete* fields using the
+    stored original annotation -- this function re-evaluates every field from the raw class
+    annotations, so that names rebound in the provided namespace (e.g. by a plugin) are picked
+    up. Field assignments (e.g. `Field(...)`) and other metadata are preserved.
+
+    This function should be called whenever a group of models needs to be rebuilt against a
+    new types namespace (see `pydantic.rebuild_models()`).
+
+    Returns:
+        A two-tuple, the first element being the re-evaluated fields, the second element being
+        the re-evaluated `PydanticExtraInfo` instance, if available.
+
+    Raises:
+        NameError: If one of the annotations failed to evaluate.
+
+    Note:
+        This function *doesn't* mutate the model fields in place, so that a failure leaves
+        the model untouched.
+    """
+    model_fields = cls.__pydantic_fields__
+
+    # Map field names to their raw annotation, together with the class the annotation was
+    # defined on (so that it is evaluated in the namespace of its defining class). Annotations
+    # from the most derived classes take precedence:
+    raw_annotations: dict[str, tuple[type[Any], Any]] = {}
+    raw_extra_annotation: tuple[type[Any], Any] | None = None
+    for base in cls.__mro__[:-1]:
+        for ann_name, raw_ann in _typing_extra.safe_get_annotations(base).items():
+            if ann_name == '__pydantic_extra__':
+                if raw_extra_annotation is None:
+                    raw_extra_annotation = (base, raw_ann)
+            elif ann_name in model_fields and ann_name not in raw_annotations:
+                raw_annotations[ann_name] = (base, raw_ann)
+
+    rebuilt_fields: dict[str, FieldInfo] = {}
+    for f_name, field_info in model_fields.items():
+        raw = raw_annotations.get(f_name)
+        if raw is None:
+            # Shouldn't happen, but keep the field untouched if no raw annotation is available:
+            rebuilt_fields[f_name] = field_info
+            continue
+        base, raw_ann = raw
+        # `_recreate_field_info()` evaluates the `_original_annotation`, so we swap in the raw
+        # annotation on a copy to have it re-evaluated against the new namespace:
+        field_copy = field_info._copy()
+        field_copy._original_annotation = raw_ann
+        with ns_resolver.push(base):
+            new_field = _recreate_field_info(
+                field_copy, ns_resolver=ns_resolver, typevars_map=typevars_map, lenient=False
+            )
+        update_field_from_config(config_wrapper, f_name, new_field)
+        rebuilt_fields[f_name] = new_field
+
+    extra_info = cls.__pydantic_extra_info__
+    if extra_info is not None:
+        if raw_extra_annotation is not None:
+            base, raw_ann = raw_extra_annotation
+            with ns_resolver.push(base):
+                # Not the best pattern (see comment in `_recreate_field_info()`):
+                ann = _typing_extra.eval_type(raw_ann, *ns_resolver.types_namespace)
+                ann = _generics.replace_types(ann, typevars_map)
+                ann = _typing_extra.eval_type(ann, *ns_resolver.types_namespace)
+            extra_info = PydanticExtraInfo(annotation=ann, complete=True)
+        elif not extra_info.complete:
+            with ns_resolver.push(cls):
+                ann = _typing_extra.eval_type(extra_info.annotation, *ns_resolver.types_namespace)
+                ann = _generics.replace_types(ann, typevars_map)
+                ann = _typing_extra.eval_type(ann, *ns_resolver.types_namespace)
+            extra_info = PydanticExtraInfo(annotation=ann, complete=True)
+
+    return rebuilt_fields, extra_info
+
+
 def collect_dataclass_fields(
     cls: type[StandardDataclass],
     *,

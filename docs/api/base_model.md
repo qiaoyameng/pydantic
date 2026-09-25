@@ -29,3 +29,7 @@ Pydantic models are simply classes which inherit from `BaseModel` and define fie
 ::: pydantic.create_model
     options:
         show_root_heading: true
+
+::: pydantic.rebuild_models
+    options:
+        show_root_heading: true

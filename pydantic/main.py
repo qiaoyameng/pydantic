@@ -11,7 +11,7 @@ import sys
 import threading
 import types
 import warnings
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from copy import copy, deepcopy
 from functools import cached_property
 from typing import (
@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
 
 
-__all__ = 'BaseModel', 'create_model'
+__all__ = 'BaseModel', 'create_model', 'rebuild_models'
 
 # Keep these type aliases available at runtime:
 TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
@@ -1895,6 +1895,55 @@ def create_model(  # noqa: C901
         _create_model_module=__module__,
         **kwds,
     )
+
+
+def rebuild_models(
+    models: Iterable[type[BaseModel]],
+    *,
+    types_namespace: _namespace_utils.MappingNamespace | None = None,
+    raise_errors: bool = True,
+) -> bool:
+    """Rebuild a group of models in a single, atomic operation.
+
+    This is useful when the names that model annotations refer to are (re)bound externally
+    (e.g. by a plugin): mutually dependent models must be rebuilt together, as rebuilding them
+    one by one (via [`BaseModel.model_rebuild()`][pydantic.BaseModel.model_rebuild]) can leave
+    the group in an inconsistent state where old and new schemas are mixed.
+
+    The dependency closure of `models` is computed first: models referenced -- directly or
+    transitively -- in field, extra and computed field annotations are included. Every model in
+    the closure then has its field annotations re-evaluated from their raw form against
+    `types_namespace` (which takes precedence over the namespace captured when each model was
+    defined, so that rebound names are picked up) and a new core schema generated. Only when
+    *all* the candidate schemas are successfully built is the new state (validator, serializer
+    and core schema -- as used for JSON Schema generation) published on each model. If any
+    annotation fails to resolve, the whole group is left untouched, in its pre-rebuild (usable)
+    state.
+
+    !!! note:
+        [`TypeAdapter`][pydantic.TypeAdapter] instances created before the rebuild keep using
+        the previous ("snapshot") state of the models. Only adapters created after the rebuild
+        see the new version.
+
+    Args:
+        models: The root models to rebuild. Duplicates are ignored, and circular references
+            between models do not result in models being rebuilt (and published) twice.
+        types_namespace: The types namespace to resolve annotations against, defaults to `None`.
+        raise_errors: Whether to raise errors, defaults to `True`. If `False`, `False` is
+            returned when the rebuild fails.
+
+    Returns:
+        `True` if the rebuild succeeded, `False` if it failed and `raise_errors` is `False`.
+    """
+    roots = list(dict.fromkeys(models))
+    for model in roots:
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            raise TypeError(f'Expected a `BaseModel` subclass, got {model!r}')
+    if not roots:
+        return True
+
+    with _rebuild_lock:
+        return _model_construction.rebuild_models(roots, types_namespace=types_namespace, raise_errors=raise_errors)
 
 
 __getattr__ = getattr_migration(__name__)
