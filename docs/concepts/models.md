@@ -768,6 +768,49 @@ print(id(m.bar) == id(m.model_copy(deep=True).bar))
 #> False
 ```
 
+### Validating copies
+
+By default, the `update` data of [`model_copy()`][pydantic.BaseModel.model_copy] is trusted as
+valid, and applied without any validation. The `validate` argument can be used to instead fully
+validate the copied data (running both field and model validators):
+
+```python
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+
+class User(BaseModel, validate_by_name=True):
+    name: str = Field(alias='userName')
+    age: int
+
+    @model_validator(mode='after')
+    def check_age(self):
+        if self.name == 'kid' and self.age >= 18:
+            raise ValueError('a kid must be under 18')
+        return self
+
+
+user = User(userName='kid', age=10)
+
+# `update` keys are interpreted according to the field name/alias
+# validation configuration:
+teen = user.model_copy(update={'userName': 'teen', 'age': 15}, validate=True)
+
+try:
+    user.model_copy(update={'age': 30}, validate=True)
+except ValidationError:
+    # `user` is left untouched
+    ...
+```
+
+When `validate` is `True`, the data of the current instance is merged with the `update` data
+and validated as a whole to build the new instance. As a consequence:
+
+* only the fields explicitly set on the current instance (or being updated) are considered as
+  [set][pydantic.BaseModel.model_fields_set] on the copy;
+* the instance's [`__dict__`][object.__dict__] is *not* copied (e.g. the value of
+  [cached properties][functools.cached_property] is not carried over);
+* private attributes and the `deep` argument retain the standard copy semantics.
+
 ## Generic models
 
 Pydantic supports the creation of generic models to make it easier to reuse a common model structure. Both the new

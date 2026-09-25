@@ -407,7 +407,13 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
 
         return m
 
-    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+        validate: bool = False,
+    ) -> Self:
         """!!! abstract "Usage Documentation"
             [`model_copy`](../concepts/models.md#model-copy)
 
@@ -417,6 +423,8 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             The underlying instance's [`__dict__`][object.__dict__] attribute is copied. This
             might have unexpected side effects if you store anything in it, on top of the model
             fields (e.g. the value of [cached properties][functools.cached_property]).
+            This does not apply when `validate` is `True`, in which case a new instance is
+            created from the validated data.
 
         Args:
             update: A mapping of values to update the copied model. Updates are *not*
@@ -425,10 +433,22 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 the model has [`extra`][pydantic.ConfigDict.extra] set to `'allow'`, they
                 are added as extra data).
             deep: Whether a [deep copy][copy.deepcopy] of the model should be performed.
+            validate: Whether the copied data should be validated. When `True`, the `update`
+                mapping is interpreted according to the field name/alias validation
+                configuration (see [`validate_by_name`][pydantic.ConfigDict.validate_by_name]
+                and [`validate_by_alias`][pydantic.ConfigDict.validate_by_alias]), merged with
+                the data of the current instance, and validated as a whole (running both field
+                and model validators) to build the new instance. Fields that were not explicitly
+                set on the current instance (nor being updated) are *not* part of the validated
+                data, so that defaults are still not considered as explicitly set on the copy.
+                If validation fails, the current instance is left untouched. Defaults to `False`.
 
         Returns:
             New model instance.
         """
+        if validate:
+            return self._model_copy_validated(update=update, deep=deep)
+
         if deep and update:
             # Only deep copy the fields that won't be updated:
             copied = self.__copy__()
@@ -466,6 +486,68 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 copied.__dict__.update(update)  # pyright: ignore[reportAttributeAccessIssue] (https://github.com/microsoft/pyright/issues/11548)
 
             copied.__pydantic_fields_set__.update(update.keys())
+
+        return copied
+
+    def _model_copy_validated(self, *, update: Mapping[str, Any] | None, deep: bool) -> Self:
+        """Returns a copy of the model, with the existing and updated data fully revalidated.
+
+        Unlike `model_copy()` (with `validate` unset), the copied instance is built by running
+        validation, meaning field and model validators are executed. As a consequence, the
+        instance's [`__dict__`][object.__dict__] attribute is *not* copied (e.g. the value of
+        [cached properties][functools.cached_property] is not carried over), and only the fields
+        explicitly set on the current instance (or being updated) are considered as set on the
+        copy. Private attributes retain the standard (shallow or deep) copy semantics.
+        """
+        cls = type(self)
+        fields = cls.__pydantic_fields__
+        by_alias = cls.model_config.get('validate_by_alias', True)
+        by_name = cls.model_config.get('validate_by_name', False)
+
+        def input_key(name: str) -> str:
+            # The key under which the field's value is expected during validation:
+            field = fields[name]
+            if by_alias:
+                if isinstance(field.validation_alias, str):
+                    return field.validation_alias
+                if field.alias is not None:
+                    return field.alias
+            return name
+
+        def resolve_field(key: str) -> str | None:
+            # The field name corresponding to the given field name or alias, if any:
+            for name, field in fields.items():
+                if key == name:
+                    if by_name or (field.alias is None and field.validation_alias is None):
+                        return name
+                elif by_alias and (key == field.alias or key == field.validation_alias):
+                    return name
+            return None
+
+        # As we may make separate `deepcopy()` calls, use a shared memo:
+        memo: dict[int, Any] = {}
+
+        data: dict[str, Any] = {}
+        for name in self.__pydantic_fields_set__:
+            if name in self.__dict__:
+                value = self.__dict__[name]
+                data[input_key(name)] = deepcopy(value, memo) if deep else value
+
+        if self.__pydantic_extra__ is not None:
+            for key, value in self.__pydantic_extra__.items():
+                data[key] = deepcopy(value, memo) if deep else value
+
+        for key, value in (update or {}).items():
+            name = resolve_field(key)
+            data[input_key(name) if name is not None else key] = value
+
+        copied = cls.model_validate(data)
+
+        if not hasattr(self, '__pydantic_private__') or self.__pydantic_private__ is None:
+            _object_setattr(copied, '__pydantic_private__', None)
+        else:
+            private = {k: v for k, v in self.__pydantic_private__.items() if v is not PydanticUndefined}
+            _object_setattr(copied, '__pydantic_private__', deepcopy(private, memo) if deep else private)
 
         return copied
 

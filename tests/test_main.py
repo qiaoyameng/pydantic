@@ -48,6 +48,7 @@ from pydantic import (
     computed_field,
     constr,
     field_validator,
+    model_validator,
 )
 from pydantic._internal._generate_schema import GenerateSchema
 from pydantic._internal._mock_val_ser import MockCoreSchema
@@ -2776,6 +2777,125 @@ def test_model_copy_extra():
     m5 = m.model_copy(update={'x': 4, 'b': 3})
     assert m5.model_dump() == {'x': 4, 'b': 3}
     assert m5.model_extra == {'b': 3}
+
+
+def test_model_copy_validate():
+    """A model with aliases, a cross-field model validator, extra data and private
+    attributes, copied with `validate=True`."""
+
+    class Model(BaseModel):
+        model_config = ConfigDict(extra='allow', validate_by_name=True, validate_by_alias=True)
+
+        name: str = Field(alias='theName')
+        age: int = 18
+        _secret: str = PrivateAttr(default='hidden')
+
+        @model_validator(mode='after')
+        def check_name_age(self):
+            if self.name == 'kid' and self.age >= 18:
+                raise ValueError('a kid must be under 18')
+            return self
+
+    m = Model(theName='kid', age=10, extra_key='extra')
+    m._secret = 's3'
+
+    # `update` is interpreted using both field names and aliases:
+    copied = m.model_copy(update={'theName': 'teen', 'age': 15, 'new_extra': 1}, validate=True)
+    assert copied.name == 'teen'
+    assert copied.age == 15
+    assert copied.model_extra == {'extra_key': 'extra', 'new_extra': 1}
+    assert copied._secret == 's3'
+    # (extra data is also part of `model_fields_set`):
+    assert copied.model_fields_set == {'name', 'age', 'extra_key', 'new_extra'}
+
+    copied_by_name = m.model_copy(update={'name': 'teen', 'age': 15}, validate=True)
+    assert copied_by_name.name == 'teen'
+
+    # field validators also run on updated values:
+    with pytest.raises(ValidationError):
+        m.model_copy(update={'age': 'not an int'}, validate=True)
+
+    # model (cross-field) validators also run:
+    with pytest.raises(ValidationError, match='a kid must be under 18'):
+        m.model_copy(update={'age': 30}, validate=True)
+
+    # and the original instance is left untouched on validation failure:
+    assert m.name == 'kid'
+    assert m.age == 10
+    assert m.model_extra == {'extra_key': 'extra'}
+    assert m.model_fields_set == {'name', 'age', 'extra_key'}
+
+
+def test_model_copy_validate_fields_set():
+    """Fields relying on defaults should not be marked as explicitly set on the copy."""
+
+    class Model(BaseModel):
+        a: int
+        b: int = 1
+
+    m = Model(a=1)
+    assert m.model_fields_set == {'a'}
+
+    copied = m.model_copy(validate=True)
+    assert copied.model_fields_set == {'a'}
+    assert copied.b == 1
+
+
+def test_model_copy_validate_cached_property_not_reused():
+    class Model(BaseModel):
+        x: int
+
+        @cached_property
+        def doubled(self) -> int:
+            return self.x * 2
+
+    m = Model(x=1)
+    assert m.doubled == 2
+    assert 'doubled' in m.__dict__
+
+    copied = m.model_copy(update={'x': 2}, validate=True)
+    assert 'doubled' not in copied.__dict__
+    assert copied.doubled == 4
+
+
+def test_model_copy_validate_frozen():
+    class Model(BaseModel):
+        model_config = ConfigDict(frozen=True)
+
+        x: int
+
+    m = Model(x=1)
+    copied = m.model_copy(update={'x': 2}, validate=True)
+    assert copied.x == 2
+    assert m.x == 1
+
+
+def test_model_copy_validate_private_attributes_and_deep():
+    class Model(BaseModel):
+        items: list[int]
+        _store: list[int] = PrivateAttr(default_factory=list)
+
+    m = Model(items=[1, 2])
+    m._store.append(1)
+
+    shallow = m.model_copy(validate=True)
+    assert shallow._store is m._store
+
+    deep = m.model_copy(validate=True, deep=True)
+    assert deep._store == m._store
+    assert deep._store is not m._store
+    assert deep.items == m.items
+    assert deep.items is not m.items
+
+
+def test_model_copy_validate_extra_forbid():
+    class Model(BaseModel, extra='forbid'):
+        x: int
+
+    m = Model(x=1)
+    with pytest.raises(ValidationError):
+        m.model_copy(update={'unknown': 1}, validate=True)
+    assert m.model_dump() == {'x': 1}
 
 
 def test_model_parametrized_name_not_generic():
