@@ -4,6 +4,7 @@ import pickle
 import re
 import sys
 from collections import UserDict
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import datetime, timezone
 from functools import partial
 from typing import Annotated, Any, Generic, Literal, TypeVar
@@ -1349,3 +1350,212 @@ def test_validate_call_self_parameter() -> None:
         return self
 
     assert func(self=1) == 1
+
+
+def _recording_gen(log: list[str]):
+    """An async generator recording its execution order in `log`."""
+
+    @validate_call(validate_return=True)
+    async def recording_gen(n: int) -> AsyncGenerator[int, str]:
+        log.append('start')
+        try:
+            for i in range(n):
+                log.append(f'yield:{i}')
+                command = yield i
+                log.append(f'cmd:{command}')
+        finally:
+            log.append('finally')
+
+    return recording_gen
+
+
+def test_async_gen_normal_iteration() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    async def run():
+        gen = recording_gen(2)
+        assert log == []  # creating the generator must not run the function body
+        assert await gen.__anext__() == 0
+        assert await gen.asend('first') == 1
+        with pytest.raises(StopAsyncIteration):
+            await gen.asend('last')
+
+    asyncio.run(run())
+    assert log == ['start', 'yield:0', 'cmd:first', 'yield:1', 'cmd:last', 'finally']
+
+
+def test_async_gen_async_for() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    async def run():
+        return [item async for item in recording_gen(3)]
+
+    assert asyncio.run(run()) == [0, 1, 2]
+    assert log == ['start', 'yield:0', 'cmd:None', 'yield:1', 'cmd:None', 'yield:2', 'cmd:None', 'finally']
+
+
+def test_async_gen_validates_arguments_only_on_call() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    with pytest.raises(ValidationError) as exc_info:
+        recording_gen('not an int')
+    assert exc_info.value.errors(include_url=False)[0]['loc'] == (0,)
+    assert log == []
+
+
+def test_async_gen_yield_validation_error() -> None:
+    log: list[str] = []
+
+    @validate_call(validate_return=True)
+    async def bad_gen() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+            yield 'not an int'  # type: ignore
+        finally:
+            log.append('finally')
+
+    async def run():
+        gen = bad_gen()
+        assert await gen.__anext__() == 1
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.__anext__()
+        return exc_info.value
+
+    error = asyncio.run(run())
+    assert error.title.endswith('bad_gen -> yield #2')
+    assert error.errors(include_url=False)[0]['input'] == 'not an int'
+    assert log == ['finally']
+
+
+def test_async_gen_send_validation_error() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    async def run():
+        gen = recording_gen(3)
+        assert await gen.__anext__() == 0
+        with pytest.raises(ValidationError) as exc_info:
+            await gen.asend(123)  # type: ignore[arg-type]
+        # the invalid value never reached the generator:
+        assert log == ['start', 'yield:0']
+        await gen.aclose()
+        return exc_info.value
+
+    error = asyncio.run(run())
+    assert error.title.endswith('recording_gen -> send #1')
+    assert log == ['start', 'yield:0', 'finally']
+
+
+def test_async_gen_athrow_runs_finally() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    async def run():
+        gen = recording_gen(3)
+        assert await gen.__anext__() == 0
+        with pytest.raises(ValueError, match='boom'):
+            await gen.athrow(ValueError('boom'))
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+    asyncio.run(run())
+    assert log == ['start', 'yield:0', 'finally']
+
+
+def test_async_gen_aclose_runs_finally() -> None:
+    log: list[str] = []
+    recording_gen = _recording_gen(log)
+
+    async def run():
+        gen = recording_gen(3)
+        assert await gen.__anext__() == 0
+        await gen.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+
+    asyncio.run(run())
+    assert log == ['start', 'yield:0', 'finally']
+
+
+def test_async_gen_cancellation_runs_finally() -> None:
+    log: list[str] = []
+
+    @validate_call(validate_return=True)
+    async def slow_gen() -> AsyncGenerator[int, None]:
+        try:
+            yield 1
+            await asyncio.sleep(60)
+            yield 2
+        finally:
+            log.append('finally')
+
+    async def run():
+        gen = slow_gen()
+        assert await gen.__anext__() == 1
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert log == ['finally']
+
+
+def test_async_gen_none_send_type() -> None:
+    @validate_call(validate_return=True)
+    async def gen() -> AsyncGenerator[int, None]:
+        yield 1
+        yield 2
+
+    async def run():
+        g = gen()
+        assert await g.__anext__() == 1
+        with pytest.raises(ValidationError) as exc_info:
+            await g.asend('not none')  # type: ignore[arg-type]
+        assert exc_info.value.title.endswith('-> send #1')
+        assert await g.asend(None) == 2
+
+    asyncio.run(run())
+
+
+def test_async_iterator_readonly() -> None:
+    """`AsyncIterator[T]` has no send type: yields are validated, sent values pass through."""
+    log: list[str] = []
+
+    @validate_call(validate_return=True)
+    async def gen() -> AsyncIterator[int]:
+        try:
+            received = yield 1
+            log.append(f'cmd:{received}')
+            yield 2
+        finally:
+            log.append('finally')
+
+    async def run():
+        g = gen()
+        assert await g.__anext__() == 1
+        # no send type annotated: the value is passed through untouched, per the original protocol
+        assert await g.asend(object()) == 2
+        with pytest.raises(StopAsyncIteration):
+            await g.__anext__()
+
+    asyncio.run(run())
+    assert log[0].startswith('cmd:')
+    assert log[1] == 'finally'
+
+
+def test_async_iterator_yield_validation_error() -> None:
+    @validate_call(validate_return=True)
+    async def gen() -> AsyncIterator[int]:
+        yield 'not an int'  # type: ignore
+
+    async def run():
+        with pytest.raises(ValidationError) as exc_info:
+            await gen().__anext__()
+        return exc_info.value
+
+    assert asyncio.run(run()).title.endswith('gen -> yield #1')
