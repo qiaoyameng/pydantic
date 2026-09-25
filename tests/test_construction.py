@@ -1,10 +1,22 @@
 import pickle
+from functools import cached_property
 from typing import Any
 
 import pytest
 from pydantic_core import PydanticUndefined, ValidationError
 
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, PrivateAttr, PydanticDeprecatedSince20
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    PydanticDeprecatedSince20,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 
 
 class Model(BaseModel):
@@ -669,3 +681,140 @@ def test_model_construct_with_alias_choices_and_path() -> None:
     assert MyModel.model_construct(a='a_value').a == 'a_value'
     assert MyModel.model_construct(aaa='a_value').a == 'a_value'
     assert MyModel.model_construct(AAA={'aaa': 'a_value'}).a == 'a_value'
+
+
+def test_model_copy_validate() -> None:
+    class Sub(BaseModel):
+        x: int
+
+    class MyModel(BaseModel):
+        model_config = ConfigDict(extra='allow', populate_by_name=True, frozen=True)
+
+        a: int
+        b: int = 5
+        aliased: str = Field(default='default', alias='ali')
+        sub: Sub
+
+        _priv: int = PrivateAttr(default=1)
+
+        @field_validator('aliased')
+        @classmethod
+        def _upper_aliased(cls, value: str) -> str:
+            return value.upper()
+
+        @model_validator(mode='after')
+        def _check_a_lt_b(self) -> 'MyModel':
+            if self.a >= self.b:
+                raise ValueError('a must be lower than b')
+            return self
+
+        @cached_property
+        def doubled(self) -> int:
+            return self.a * 2
+
+    m = MyModel(a=1, ali='hello', sub={'x': 2}, extra_key='extra_value')
+    m._priv = 42
+    m.doubled  # noqa: B018 (populate the cached property in `__dict__`)
+
+    # `update` keys are interpreted as field names or aliases, and field validators run:
+    copied = m.model_copy(update={'ali': 'world', 'a': 2}, validate=True)
+    assert copied.a == 2
+    assert copied.aliased == 'WORLD'
+    assert copied.sub == Sub(x=2)
+    assert copied.extra_key == 'extra_value'
+
+    # field names are also accepted:
+    assert m.model_copy(update={'aliased': 'yo'}, validate=True).aliased == 'YO'
+
+    # private attributes follow the copy semantics:
+    assert copied._priv == 42
+
+    # fields relying on defaults are not marked as explicitly set:
+    assert copied.__pydantic_fields_set__ == {'a', 'aliased', 'sub', 'extra_key'}
+
+    # stale cached properties are not carried over to the copy:
+    assert 'doubled' not in copied.__dict__
+    assert copied.doubled == 4
+
+    # the frozen model is not mutated, a new instance is created:
+    assert m.a == 1
+    assert m.doubled == 2
+
+
+def test_model_copy_validate_failure_leaves_original_untouched() -> None:
+    class Sub(BaseModel):
+        x: int
+
+    class MyModel(BaseModel):
+        a: int
+        b: int = 5
+        sub: Sub
+
+        @model_validator(mode='after')
+        def _check_a_lt_b(self) -> 'MyModel':
+            if self.a >= self.b:
+                raise ValueError('a must be lower than b')
+            return self
+
+    m = MyModel(a=1, sub={'x': 2})
+
+    with pytest.raises(ValidationError):
+        m.model_copy(update={'a': 10}, validate=True)
+
+    assert m.a == 1
+    assert m.sub.x == 2
+    assert m.__pydantic_fields_set__ == {'a', 'sub'}
+
+
+def test_model_copy_validate_deep() -> None:
+    class Sub(BaseModel):
+        x: int
+
+    class MyModel(BaseModel):
+        a: int
+        sub: Sub
+
+        _priv: list = PrivateAttr(default_factory=list)
+
+    m = MyModel(a=1, sub={'x': 2})
+    m._priv.append(1)
+
+    shallow = m.model_copy(validate=True)
+    assert shallow.sub is m.sub
+    assert shallow._priv is m._priv
+
+    deep = m.model_copy(deep=True, validate=True)
+    assert deep.sub is not m.sub
+    assert deep.sub == m.sub
+    assert deep._priv == m._priv
+    assert deep._priv is not m._priv
+
+
+def test_model_copy_validate_extra_forbid_rejects_unknown_keys() -> None:
+    class MyModel(BaseModel):
+        model_config = ConfigDict(extra='forbid')
+
+        a: int
+
+    m = MyModel(a=1)
+
+    with pytest.raises(ValidationError):
+        m.model_copy(update={'unknown': 1}, validate=True)
+
+    # the default (non-validating) behavior is unchanged:
+    assert m.model_copy(update={'a': 'not an int'}).a == 'not an int'
+
+
+def test_model_copy_validate_root_model() -> None:
+    class MyRootModel(RootModel[int]):
+        pass
+
+    m = MyRootModel(1)
+
+    copied = m.model_copy(update={'root': '2'}, validate=True)
+    assert copied.root == 2
+    assert copied.__pydantic_fields_set__ == {'root'}
+
+    with pytest.raises(ValidationError):
+        m.model_copy(update={'root': 'not an int'}, validate=True)
+    assert m.root == 1

@@ -768,6 +768,33 @@ print(id(m.bar) == id(m.model_copy(deep=True).bar))
 #> False
 ```
 
+By default, `update` data is *not* validated. If you need the updated values to be checked
+(e.g. when they come from an untrusted source), pass `validate=True`: the `update` keys are
+interpreted as field names or aliases, merged with the current field data, and the result goes
+through full validation (field *and* model validators). If validation fails, the original
+instance is left untouched.
+
+```python
+from pydantic import BaseModel, ValidationError
+
+
+class User(BaseModel):
+    name: str
+    age: int
+
+
+user = User(name='John', age=30)
+
+print(user.model_copy(update={'age': '31'}, validate=True))
+#> name='John' age=31
+
+try:
+    user.model_copy(update={'age': 'not an int'}, validate=True)
+except ValidationError:
+    print('Invalid update!')
+    #> Invalid update!
+```
+
 ## Generic models
 
 Pydantic supports the creation of generic models to make it easier to reuse a common model structure. Both the new
