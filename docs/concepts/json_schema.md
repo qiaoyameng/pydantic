@@ -295,6 +295,55 @@ print(Model.model_json_schema(mode='serialization'))
 """
 ```
 
+### Choosing the JSON Schema dialect
+
+By default, schemas are generated for the [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/schema)
+dialect. If your downstream tooling only supports [JSON Schema Draft 7](http://json-schema.org/draft-07/schema#),
+you can request a Draft 7 compatible schema via the `schema_dialect` parameter, available on
+[`model_json_schema`][pydantic.main.BaseModel.model_json_schema],
+[`TypeAdapter.json_schema`][pydantic.type_adapter.TypeAdapter.json_schema], and
+[`GenerateJsonSchema`][pydantic.json_schema.GenerateJsonSchema]:
+
+```python
+from pydantic import BaseModel
+from pydantic.json_schema import JSON_SCHEMA_DIALECT_DRAFT_07
+
+
+class Model(BaseModel):
+    t: tuple[int, str]
+
+
+print(Model.model_json_schema(schema_dialect=JSON_SCHEMA_DIALECT_DRAFT_07))
+"""
+{
+    '$schema': 'http://json-schema.org/draft-07/schema#',
+    'properties': {
+        't': {
+            'items': [{'type': 'integer'}, {'type': 'string'}],
+            'maxItems': 2,
+            'minItems': 2,
+            'title': 'T',
+            'type': 'array',
+        }
+    },
+    'required': ['t'],
+    'title': 'Model',
+    'type': 'object',
+}
+"""
+```
+
+The Draft 7 conversion is more than a `$schema` declaration change: `$defs` is renamed to `definitions`
+(with all `$ref`s rewritten accordingly), `prefixItems` becomes a Draft 7 `items` array (with any
+post-prefix `items` schema moved to `additionalItems`), `dependentRequired`/`dependentSchemas` are merged
+into `dependencies`, and `$ref`s with sibling keywords are wrapped in `allOf` (in Draft 7, siblings of
+`$ref` are ignored).
+
+If the schema contains constructs that cannot be faithfully expressed in Draft 7 (such as
+`unevaluatedProperties` or `minContains`), a
+[`PydanticInvalidForJsonSchema`][pydantic.errors.PydanticInvalidForJsonSchema] error is raised identifying
+the exact path and keyword, rather than silently loosening the constraints.
+
 ## Customizing JSON Schema
 
 The generated JSON schema can be customized at both the [field level](#field-level-customization) and [model level](#model-level-customization).

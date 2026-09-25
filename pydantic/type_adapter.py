@@ -675,6 +675,7 @@ class TypeAdapter(Generic[T]):
         union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
         schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
         mode: JsonSchemaMode = 'validation',
+        schema_dialect: str | None = None,
     ) -> dict[str, Any]:
         """Generate a JSON schema for the adapted type.
 
@@ -692,6 +693,10 @@ class TypeAdapter(Generic[T]):
             schema_generator: To override the logic used to generate the JSON schema, as a subclass of
                 `GenerateJsonSchema` with your desired modifications
             mode: The mode in which to generate the schema.
+            schema_dialect: The JSON schema dialect to generate the schema for. Defaults to
+                `'https://json-schema.org/draft/2020-12/schema'`. Pass
+                `'http://json-schema.org/draft-07/schema#'` to produce a schema compatible with
+                JSON Schema Draft 7.
 
         Returns:
             The JSON schema for the model as a dictionary.
@@ -699,6 +704,8 @@ class TypeAdapter(Generic[T]):
         schema_generator_instance = schema_generator(
             by_alias=by_alias, ref_template=ref_template, union_format=union_format
         )
+        if schema_dialect is not None:
+            schema_generator_instance.schema_dialect = schema_dialect
         if isinstance(self.core_schema, _mock_val_ser.MockCoreSchema):
             self.core_schema.rebuild()
             assert not isinstance(self.core_schema, _mock_val_ser.MockCoreSchema), 'this is a bug! please report it'
@@ -718,6 +725,7 @@ class TypeAdapter(Generic[T]):
         ref_template: str = DEFAULT_REF_TEMPLATE,
         union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
         schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+        schema_dialect: str | None = None,
     ) -> tuple[dict[tuple[JsonSchemaKeyT, JsonSchemaMode], JsonSchemaValue], JsonSchemaValue]:
         """Generate a JSON schema including definitions from multiple type adapters.
 
@@ -738,6 +746,10 @@ class TypeAdapter(Generic[T]):
                 type (`string`, `boolean`, `null`, `integer` or `number`) or contains constraints/metadata, falls back to
                 `any_of`.
             schema_generator: The generator class used for creating the schema.
+            schema_dialect: The JSON schema dialect to generate the schema for. Defaults to
+                `'https://json-schema.org/draft/2020-12/schema'`. Pass
+                `'http://json-schema.org/draft-07/schema#'` to produce a schema compatible with
+                JSON Schema Draft 7.
 
         Returns:
             A tuple where:
@@ -752,6 +764,8 @@ class TypeAdapter(Generic[T]):
         schema_generator_instance = schema_generator(
             by_alias=by_alias, ref_template=ref_template, union_format=union_format
         )
+        if schema_dialect is not None:
+            schema_generator_instance.schema_dialect = schema_dialect
 
         inputs_ = []
         for key, mode, adapter in inputs:
@@ -767,7 +781,7 @@ class TypeAdapter(Generic[T]):
 
         json_schema: dict[str, Any] = {}
         if definitions:
-            json_schema['$defs'] = definitions
+            json_schema[schema_generator_instance._defs_key] = definitions
         if title:
             json_schema['title'] = title
         if description:

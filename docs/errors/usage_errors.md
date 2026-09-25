@@ -640,6 +640,14 @@ except PydanticUserError as exc_info:
 This error is raised when the JSON schema generator has already been used to generate a JSON schema.
 You must create a new instance to generate a new JSON schema.
 
+## JSON schema unsupported dialect {#json-schema-unsupported-dialect}
+
+This error is raised when an unsupported JSON schema dialect is requested during JSON schema generation,
+e.g. via the `schema_dialect` argument of
+[`GenerateJsonSchema`][pydantic.json_schema.GenerateJsonSchema].
+The supported dialects are Draft 2020-12 (`https://json-schema.org/draft/2020-12/schema`, the default)
+and Draft 7 (`http://json-schema.org/draft-07/schema#`).
+
 ## BaseModel instantiated {#base-model-instantiated}
 
 This error is raised when you instantiate `BaseModel` directly. Pydantic models should inherit from `BaseModel`.

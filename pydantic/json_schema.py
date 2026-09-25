@@ -116,6 +116,35 @@ for a core schema with a default value.
 DEFAULT_REF_TEMPLATE = '#/$defs/{model}'
 """The default format string used to generate reference names."""
 
+JSON_SCHEMA_DIALECT_2020_12 = 'https://json-schema.org/draft/2020-12/schema'
+"""The JSON Schema Draft 2020-12 dialect identifier. This is the default dialect used for schema generation."""
+
+JSON_SCHEMA_DIALECT_DRAFT_07 = 'http://json-schema.org/draft-07/schema#'
+"""The JSON Schema Draft 7 dialect identifier. Supported as an explicit opt-in for downstream consumers
+that only understand Draft 7."""
+
+SUPPORTED_SCHEMA_DIALECTS = (JSON_SCHEMA_DIALECT_2020_12, JSON_SCHEMA_DIALECT_DRAFT_07)
+"""The JSON Schema dialects that schema generation can faithfully target."""
+
+# Keywords that carry validation semantics in Draft 2019-09 / 2020-12 but have no equivalent in Draft 7.
+# When one of these is encountered while generating a Draft 7 schema, we refuse to silently drop the
+# constraint and raise an error instead.
+_DRAFT_7_UNSUPPORTED_KEYWORDS = frozenset(
+    [
+        'unevaluatedProperties',
+        'unevaluatedItems',
+        'minContains',
+        'maxContains',
+        'contentSchema',
+        '$anchor',
+        '$recursiveAnchor',
+        '$recursiveRef',
+        '$dynamicAnchor',
+        '$dynamicRef',
+        '$vocabulary',
+    ]
+)
+
 # There are three types of references relevant to building JSON schemas:
 #   1. core_schema "ref" values; these are not exposed as part of the JSON schema
 #       * these might look like the fully qualified path of a model, its id, or something similar
@@ -257,12 +286,19 @@ class GenerateJsonSchema:
               keyword as an array of strings, containing each type of the combination. If any of the schemas is not a primitive
               type (`string`, `boolean`, `null`, `integer` or `number`) or contains constraints/metadata, falls back to
               `any_of`.
+        schema_dialect: The JSON schema dialect to generate the schema for. Defaults to
+            `'https://json-schema.org/draft/2020-12/schema'`. When set to
+            `'http://json-schema.org/draft-07/schema#'`, the generated schema is converted to be
+            compatible with JSON Schema Draft 7 (e.g. `$defs` becomes `definitions`, `prefixItems`
+            becomes an `items` array, and `$ref`s with sibling keywords are wrapped in `allOf`).
+            If the schema contains constructs that cannot be faithfully expressed in Draft 7,
+            a `PydanticInvalidForJsonSchema` error is raised identifying the offending path and keyword.
 
     Raises:
         JsonSchemaError: If the instance of the class is inadvertently reused after generating a schema.
     """
 
-    schema_dialect = 'https://json-schema.org/draft/2020-12/schema'
+    schema_dialect = JSON_SCHEMA_DIALECT_2020_12
 
     # `self.render_warning_message` will do nothing if its argument `kind` is in `ignored_warning_kinds`;
     # this value can be modified on subclasses to easily control which warnings are emitted
@@ -273,10 +309,14 @@ class GenerateJsonSchema:
         by_alias: bool = True,
         ref_template: str = DEFAULT_REF_TEMPLATE,
         union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
+        schema_dialect: str | None = None,
     ) -> None:
         self.by_alias = by_alias
         self.ref_template = ref_template
         self.union_format: Literal['any_of', 'primitive_type_array'] = union_format
+        if schema_dialect is not None:
+            self.schema_dialect = schema_dialect
+        self._validate_schema_dialect()
 
         self.core_to_json_refs: dict[CoreModeRef, JsonRef] = {}
         self.core_to_defs_refs: dict[CoreModeRef, DefsRef] = {}
@@ -372,6 +412,7 @@ class GenerateJsonSchema:
         Raises:
             PydanticUserError: Raised if the JSON schema generator has already been used to generate a JSON schema.
         """
+        self._validate_schema_dialect()
         if self._used:
             raise PydanticUserError(
                 'This JSON schema generator has already been used to generate a JSON schema. '
@@ -394,7 +435,12 @@ class GenerateJsonSchema:
         json_schema = {'$defs': self.definitions}
         json_schema = definitions_remapping.remap_json_schema(json_schema)
         self._used = True
-        return json_schemas_map, self.sort(json_schema['$defs'])  # type: ignore
+        if self._is_draft_07:
+            json_schemas_map = {
+                key: self._convert_json_schema_to_draft_07(value) for key, value in json_schemas_map.items()
+            }
+            json_schema = self._convert_json_schema_to_draft_07(json_schema)
+        return json_schemas_map, self.sort(json_schema[self._defs_key])  # type: ignore
 
     def generate(self, schema: CoreSchema, mode: JsonSchemaMode = 'validation') -> JsonSchemaValue:
         """Generates a JSON schema for a specified schema in a specified mode.
@@ -409,6 +455,7 @@ class GenerateJsonSchema:
         Raises:
             PydanticUserError: If the JSON schema generator has already been used to generate a JSON schema.
         """
+        self._validate_schema_dialect()
         self._mode = mode
         if self._used:
             raise PydanticUserError(
@@ -438,12 +485,125 @@ class GenerateJsonSchema:
 
         json_schema = definitions_remapping.remap_json_schema(json_schema)
 
-        # For now, we will not set the $schema key. However, if desired, this can be easily added by overriding
-        # this method and adding the following line after a call to super().generate(schema):
+        if self._is_draft_07:
+            json_schema = self._convert_json_schema_to_draft_07(json_schema)
+            json_schema['$schema'] = self.schema_dialect
+
+        # For the default dialect, we will not set the $schema key. However, if desired, this can be easily
+        # added by overriding this method and adding the following line after a call to super().generate(schema):
         # json_schema['$schema'] = self.schema_dialect
 
         self._used = True
         return self.sort(json_schema)
+
+    @property
+    def _is_draft_07(self) -> bool:
+        return self.schema_dialect == JSON_SCHEMA_DIALECT_DRAFT_07
+
+    @property
+    def _defs_key(self) -> str:
+        """The key under which reusable definitions are stored for the configured dialect."""
+        return 'definitions' if self._is_draft_07 else '$defs'
+
+    def _validate_schema_dialect(self) -> None:
+        if self.schema_dialect not in SUPPORTED_SCHEMA_DIALECTS:
+            raise PydanticUserError(
+                f'Unsupported JSON schema dialect: {self.schema_dialect!r}. '
+                f'Supported dialects are: {", ".join(SUPPORTED_SCHEMA_DIALECTS)}.',
+                code='json-schema-unsupported-dialect',
+            )
+
+    def _convert_json_schema_to_draft_07(self, json_schema: JsonSchemaValue) -> JsonSchemaValue:
+        """Convert a generated JSON schema (Draft 2020-12) into an equivalent Draft 7 schema.
+
+        The conversion renames `$defs` to `definitions` (rewriting `$ref`s accordingly), turns
+        `prefixItems` into a Draft 7 `items` array (moving any post-prefix `items` schema to
+        `additionalItems`), merges `dependentRequired`/`dependentSchemas` into `dependencies`, and
+        wraps `$ref`s that have sibling keywords in `allOf` (in Draft 7, siblings of `$ref` are
+        ignored). Keywords that cannot be expressed in Draft 7 without loosening the constraints
+        cause a `PydanticInvalidForJsonSchema` error identifying the exact path and keyword.
+        """
+        return self._convert_node_to_draft_07(json_schema, path='$')
+
+    def _convert_node_to_draft_07(self, node: Any, path: str) -> Any:
+        if isinstance(node, list):
+            return [self._convert_node_to_draft_07(item, f'{path}[{index}]') for index, item in enumerate(node)]
+        if not isinstance(node, dict):
+            return node
+
+        for key in node:
+            if key in _DRAFT_7_UNSUPPORTED_KEYWORDS:
+                raise PydanticInvalidForJsonSchema(
+                    f'Cannot generate a JSON Schema Draft 7 schema: the keyword {key!r} at {path!r} '
+                    'has no equivalent in Draft 7 and cannot be removed without loosening the constraints. '
+                    f'Use the default dialect ({JSON_SCHEMA_DIALECT_2020_12!r}) instead.'
+                )
+
+        node = dict(node)
+
+        # Draft 2020-12 `prefixItems` + `items` (post-prefix) => Draft 7 `items` array + `additionalItems`
+        if 'prefixItems' in node:
+            prefix_items = node.pop('prefixItems')
+            additional_items = node.pop('items', True)
+            node['items'] = prefix_items
+            if additional_items is not True:
+                node['additionalItems'] = additional_items
+
+        # Draft 2019-09+ `dependentRequired`/`dependentSchemas` => Draft 7 `dependencies`
+        dependencies: dict[str, Any] = {}
+        for key in ('dependentRequired', 'dependentSchemas'):
+            if key in node:
+                new_dependencies = node.pop(key)
+                conflicts = set(dependencies).intersection(new_dependencies)
+                if conflicts:
+                    raise PydanticInvalidForJsonSchema(
+                        f'Cannot generate a JSON Schema Draft 7 schema: merging '
+                        f"'dependentRequired'/'dependentSchemas' into 'dependencies' at {path!r} "
+                        f'would produce conflicting entries for: {sorted(conflicts)}.'
+                    )
+                dependencies.update(new_dependencies)
+        if dependencies:
+            existing = node.get('dependencies')
+            if existing:
+                conflicts = set(existing).intersection(dependencies)
+                if conflicts:
+                    raise PydanticInvalidForJsonSchema(
+                        f'Cannot generate a JSON Schema Draft 7 schema: merging '
+                        f"'dependentRequired'/'dependentSchemas' into 'dependencies' at {path!r} "
+                        f'would produce conflicting entries for: {sorted(conflicts)}.'
+                    )
+                dependencies = {**existing, **dependencies}
+            node['dependencies'] = dependencies
+
+        # Draft 2020-12 `$defs` => Draft 7 `definitions`
+        if '$defs' in node:
+            if 'definitions' in node:
+                raise PydanticInvalidForJsonSchema(
+                    f"Cannot generate a JSON Schema Draft 7 schema: both '$defs' and 'definitions' "
+                    f'are present at {path!r} and cannot be merged safely.'
+                )
+            node['definitions'] = node.pop('$defs')
+
+        converted: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == '$ref' and isinstance(value, str):
+                converted[key] = self._convert_ref_to_draft_07(value)
+            else:
+                converted[key] = self._convert_node_to_draft_07(value, f'{path}.{key}')
+
+        # In Draft 7, siblings of `$ref` are ignored, so move the `$ref` into an `allOf` to preserve them
+        if '$ref' in converted and len(converted) > 1:
+            ref = converted.pop('$ref')
+            converted = {'allOf': [{'$ref': ref}], **converted}
+
+        return converted
+
+    @staticmethod
+    def _convert_ref_to_draft_07(ref: str) -> str:
+        """Rewrite local `$ref` pointers, replacing any `$defs` path segment with `definitions`."""
+        if not ref.startswith('#'):
+            return ref
+        return '/'.join('definitions' if segment == '$defs' else segment for segment in ref.split('/'))
 
     def generate_inner(self, schema: CoreSchemaOrField) -> JsonSchemaValue:  # noqa: C901
         """Generates a JSON schema for a given core schema.
@@ -2719,6 +2879,8 @@ def model_json_schema(
     union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
     schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
     mode: JsonSchemaMode = 'validation',
+    *,
+    schema_dialect: str | None = None,
 ) -> dict[str, Any]:
     """Utility function to generate a JSON Schema for a model.
 
@@ -2740,6 +2902,10 @@ def model_json_schema(
 
             - 'validation': Generate a JSON Schema for validating data.
             - 'serialization': Generate a JSON Schema for serializing data.
+        schema_dialect: The JSON schema dialect to generate the schema for. Defaults to
+            `'https://json-schema.org/draft/2020-12/schema'`. Pass
+            `'http://json-schema.org/draft-07/schema#'` to produce a schema compatible with
+            JSON Schema Draft 7.
 
     Returns:
         The generated JSON Schema.
@@ -2749,6 +2915,8 @@ def model_json_schema(
     schema_generator_instance = schema_generator(
         by_alias=by_alias, ref_template=ref_template, union_format=union_format
     )
+    if schema_dialect is not None:
+        schema_generator_instance.schema_dialect = schema_dialect
 
     if isinstance(cls.__pydantic_core_schema__, _mock_val_ser.MockCoreSchema):
         cls.__pydantic_core_schema__.rebuild()
@@ -2769,6 +2937,7 @@ def models_json_schema(
     ref_template: str = DEFAULT_REF_TEMPLATE,
     union_format: Literal['any_of', 'primitive_type_array'] = 'any_of',
     schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+    schema_dialect: str | None = None,
 ) -> tuple[dict[tuple[type[BaseModel] | type[PydanticDataclass], JsonSchemaMode], JsonSchemaValue], JsonSchemaValue]:
     """Utility function to generate a JSON Schema for multiple models.
 
@@ -2787,6 +2956,10 @@ def models_json_schema(
               type (`string`, `boolean`, `null`, `integer` or `number`) or contains constraints/metadata, falls back to
               `any_of`.
         schema_generator: The schema generator to use for generating the JSON Schema.
+        schema_dialect: The JSON schema dialect to generate the schema for. Defaults to
+            `'https://json-schema.org/draft/2020-12/schema'`. Pass
+            `'http://json-schema.org/draft-07/schema#'` to produce a schema compatible with
+            JSON Schema Draft 7.
 
     Returns:
         A tuple where:
@@ -2801,6 +2974,8 @@ def models_json_schema(
             cls.__pydantic_core_schema__.rebuild()
 
     instance = schema_generator(by_alias=by_alias, ref_template=ref_template, union_format=union_format)
+    if schema_dialect is not None:
+        instance.schema_dialect = schema_dialect
     inputs: list[tuple[type[BaseModel] | type[PydanticDataclass], JsonSchemaMode, CoreSchema]] = [
         (m, mode, m.__pydantic_core_schema__) for m, mode in models
     ]
@@ -2808,7 +2983,7 @@ def models_json_schema(
 
     json_schema: dict[str, Any] = {}
     if definitions:
-        json_schema['$defs'] = definitions
+        json_schema[instance._defs_key] = definitions
     if title:
         json_schema['title'] = title
     if description:

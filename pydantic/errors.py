@@ -46,6 +46,7 @@ PydanticErrorCodes = Literal[
     'circular-reference-schema',
     'invalid-for-json-schema',
     'json-schema-already-used',
+    'json-schema-unsupported-dialect',
     'base-model-instantiated',
     'undefined-annotation',
     'schema-for-unknown-type',

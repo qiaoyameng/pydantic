@@ -182,11 +182,18 @@ def validate_json_schemas(monkeypatch: pytest.MonkeyPatch, request: pytest.Fixtu
         def generate(*args: Any, **kwargs: Any) -> Any:
             json_schema = orig_generate(*args, **kwargs)
             if not request.node.get_closest_marker('skip_json_schema_validation'):
+                # Schemas generated for a non-default dialect declare it via the `$schema` key:
+                if json_schema.get('$schema') == 'http://json-schema.org/draft-07/schema#':
+                    from jsonschema import Draft7Validator
+
+                    validator_class = Draft7Validator
+                else:
+                    validator_class = Draft202012Validator
                 try:
-                    Draft202012Validator.check_schema(json_schema)
+                    validator_class.check_schema(json_schema)
                 except SchemaError:
                     pytest.fail(
-                        'Failed to validate the JSON Schema against the Draft 2020-12 spec. '
+                        'Failed to validate the JSON Schema against the spec for its dialect. '
                         'If this is expected, you can mark the test function with the `skip_json_schema_validation` '
                         'marker. Note that this validation only takes place during tests, and is not active at runtime.'
                     )
