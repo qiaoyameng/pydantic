@@ -108,7 +108,7 @@ from ._fields import (
     update_field_from_config,
 )
 from ._forward_ref import PydanticRecursiveRef
-from ._generics import get_standard_typevars_map, replace_types
+from ._generics import get_standard_typevars_map, replace_types, typevartuple_default_types
 from ._import_utils import import_cached_base_model, import_cached_field_info
 from ._mock_val_ser import MockCoreSchema
 from ._namespace_utils import NamespacesTuple, NsResolver
@@ -1716,6 +1716,27 @@ class GenerateSchema:
             else:
                 # special case for `tuple[()]` which means `tuple[]` - an empty tuple
                 return core_schema.tuple_schema([])
+        elif (
+            unpack_index := next(
+                (i for i, param in enumerate(params) if _typing_extra.unpack_type(param) is not None), None
+            )
+        ) is not None:
+            # Handle unpacked `TypeVarTuple`s (PEP 646), e.g. `tuple[int, *Ts]`.
+            # As the `TypeVarTuple` is unsubstituted at this point, it is treated as
+            # a variadic `Any` item (mirroring how unsubstituted typevars are handled).
+            unpack_types = [_typing_extra.unpack_type(param) for param in params]
+            if sum(unpacked is not None for unpacked in unpack_types) > 1:
+                raise ValueError('Tuple types with more than one unpacked TypeVarTuple are not supported')
+            tvt_default = typevartuple_default_types(unpack_types[unpack_index])
+            if tvt_default is not None:
+                # The `TypeVarTuple` has a default (e.g. `default=Unpack[tuple[int, ...]]`),
+                # use it in place of the unpacked `TypeVarTuple`:
+                params = params[:unpack_index] + tvt_default + params[unpack_index + 1 :]
+                return self._tuple_schema(tuple[params] if params else tuple[()])
+            items = [self.generate_schema(param) for param in params[:unpack_index]]
+            items.append(core_schema.any_schema())
+            items.extend(self.generate_schema(param) for param in params[unpack_index + 1 :])
+            return core_schema.tuple_schema(items, variadic_item_index=unpack_index)
         elif params[-1] is Ellipsis:
             if len(params) == 2:
                 return core_schema.tuple_schema([self.generate_schema(params[0])], variadic_item_index=0)

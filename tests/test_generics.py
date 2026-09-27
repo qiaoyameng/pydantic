@@ -2676,10 +2676,6 @@ def test_generic_intenum_bound():
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
-@pytest.mark.xfail(
-    reason='TODO: Variadic generic parametrization is not supported yet;'
-    ' Issue: https://github.com/pydantic/pydantic/issues/5804'
-)
 def test_variadic_generic_init():
     class ComponentModel(BaseModel):
         pass
@@ -2703,18 +2699,20 @@ def test_variadic_generic_init():
         def all_components(self) -> tuple[ComponentVar, Unpack[NumberOfComponents]]:
             return (self.main_component, *self.left_component_pocket, *self.right_component_pocket)
 
-    sa, sb, w = Screwdriver(), Screwdriver(), Wrench()
+    sa, sb, w = Screwdriver(), Screwdriver(), Screwdriver()
     my_toolbox = VariadicToolbox[Screwdriver, Screwdriver, Wrench](
         main_component=sa, left_component_pocket=[w], right_component_pocket=[sb]
     )
 
-    assert my_toolbox.all_components == [sa, w, sb]
+    assert my_toolbox.all_components == (sa, w, sb)
+    assert my_toolbox.model_dump()['all_components'] == (sa.model_dump(), w.model_dump(), sb.model_dump())
+
+    with pytest.raises(ValidationError):
+        # `left_component_pocket` items must be `Screwdriver` instances:
+        VariadicToolbox[Screwdriver, Screwdriver, Wrench](main_component=sa, left_component_pocket=[Wrench()])
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
-@pytest.mark.xfail(
-    reason='TODO: Variadic fields are not supported yet; Issue: https://github.com/pydantic/pydantic/issues/5804'
-)
 def test_variadic_generic_with_variadic_fields():
     class ComponentModel(BaseModel):
         pass
@@ -2732,14 +2730,145 @@ def test_variadic_generic_with_variadic_fields():
         toolbelt_cm_size: tuple[Unpack[NumberOfComponents]] | None = Field(default_factory=tuple)
         manual_toolset: tuple[ComponentVar, Unpack[NumberOfComponents]] | None = Field(default_factory=tuple)
 
-    MyToolboxClass = VariadicToolbox[Screwdriver, Screwdriver, Wrench]
+    MyToolboxClass = VariadicToolbox[Screwdriver, float, float]
 
-    sa, sb, w = Screwdriver(), Screwdriver(), Wrench()
-    MyToolboxClass(toolbelt_cm_size=(5, 10.5, 4), manual_toolset=(sa, sb, w))
+    sa, w = Screwdriver(), Wrench()
+    toolbox = MyToolboxClass(toolbelt_cm_size=(5.0, 10.5), manual_toolset=(sa, 1.5, 2.5))
+    assert toolbox.toolbelt_cm_size == (5.0, 10.5)
+    assert toolbox.manual_toolset == (sa, 1.5, 2.5)
 
-    with pytest.raises(TypeError):
-        # Should raise error because integer 5 does not meet the bound requirements of ComponentVar
-        MyToolboxClass(manual_toolset=(sa, sb, 5))
+    with pytest.raises(ValidationError):
+        # Should raise an error because a `Wrench` is not a `Screwdriver`:
+        MyToolboxClass(manual_toolset=(w, 1.5, 2.5))
+
+    with pytest.raises(ValidationError):
+        # Should raise an error because of the tuple length mismatch:
+        MyToolboxClass(manual_toolset=(sa, 1.5))
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
+def test_variadic_generic_model():
+    Ts = TypeVarTuple('Ts')
+
+    class Packet(BaseModel, Generic[Unpack[Ts]]):
+        values: tuple[Unpack[Ts]]
+
+    IntStrPacket = Packet[int, str]
+    assert IntStrPacket(values=(1, 'a')).values == (1, 'a')
+
+    with pytest.raises(ValidationError) as exc_info:
+        IntStrPacket(values=(1, 2))
+    assert exc_info.value.errors()[0]['type'] == 'string_type'
+
+    with pytest.raises(ValidationError) as exc_info:
+        IntStrPacket(values=(1, 'a', 3))
+    assert exc_info.value.errors()[0]['type'] == 'too_long'
+
+    # The empty tuple parametrization only accepts empty tuples:
+    EmptyPacket = Packet[()]
+    assert EmptyPacket(values=()).values == ()
+    with pytest.raises(ValidationError):
+        EmptyPacket(values=(1,))
+
+    # The unparametrized generic model accepts tuples of any length and type:
+    assert Packet(values=(1, 'a', 2.5)).values == (1, 'a', 2.5)
+
+    # Repeated parametrizations are cached:
+    assert Packet[int, str] is IntStrPacket
+    assert Packet[()] is EmptyPacket
+
+    assert IntStrPacket(values=(1, 'a')).model_dump() == {'values': (1, 'a')}
+    assert IntStrPacket(values=(1, 'a')).model_dump_json() == '{"values":[1,"a"]}'
+    assert IntStrPacket.model_json_schema() == {
+        'properties': {
+            'values': {
+                'maxItems': 2,
+                'minItems': 2,
+                'prefixItems': [{'type': 'integer'}, {'type': 'string'}],
+                'title': 'Values',
+                'type': 'array',
+            }
+        },
+        'required': ['values'],
+        'title': 'Packet[int, str]',
+        'type': 'object',
+    }
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
+def test_variadic_generic_model_mixed_with_typevars():
+    T = TypeVar('T')
+    Ts = TypeVarTuple('Ts')
+
+    class Model(BaseModel, Generic[T, Unpack[Ts]]):
+        head: T
+        rest: tuple[Unpack[Ts]]
+
+    assert Model[int, str, bytes](head=1, rest=('a', b'b')).rest == ('a', b'b')
+    # The `TypeVarTuple` can absorb zero arguments:
+    assert Model[int](head=1, rest=()).rest == ()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Model[int](head=1, rest=('a',))
+    assert exc_info.value.errors()[0]['type'] == 'too_long'
+
+    with pytest.raises(TypeError, match='Too few arguments'):
+        Model[()]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
+def test_variadic_generic_model_subclass_specialization():
+    Ts = TypeVarTuple('Ts')
+
+    class Packet(BaseModel, Generic[Unpack[Ts]]):
+        values: tuple[Unpack[Ts]]
+
+    class IntPacket(Packet[int, Unpack[Ts]], Generic[Unpack[Ts]]):
+        pass
+
+    IntStrPacket = IntPacket[str]
+    assert IntStrPacket(values=(1, 'a')).values == (1, 'a')
+    with pytest.raises(ValidationError) as exc_info:
+        IntStrPacket(values=('a', 'a'))
+    assert exc_info.value.errors()[0]['type'] == 'int_parsing'
+
+    # Subclassing a fully parametrized model results in a concrete model:
+    class ConcretePacket(Packet[int, str]):
+        pass
+
+    assert ConcretePacket(values=(1, 'a')).values == (1, 'a')
+    assert ConcretePacket.__pydantic_generic_metadata__['parameters'] == ()
+    with pytest.raises(TypeError, match='is not a generic class'):
+        ConcretePacket[int]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
+def test_variadic_generic_model_recursive():
+    Ts = TypeVarTuple('Ts')
+
+    class Node(BaseModel, Generic[Unpack[Ts]]):
+        values: tuple[Unpack[Ts]]
+        child: 'Node[Unpack[Ts]] | None' = None
+
+    IntStrNode = Node[int, str]
+    node = IntStrNode(values=(1, 'a'), child={'values': (2, 'b')})
+    assert node.child.values == (2, 'b')
+    assert node.model_dump() == {'values': (1, 'a'), 'child': {'values': (2, 'b'), 'child': None}}
+
+    with pytest.raises(ValidationError) as exc_info:
+        IntStrNode(values=(1, 'a'), child={'values': (2, 3)})
+    assert exc_info.value.errors()[0]['type'] == 'string_type'
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='requires python 3.11 or higher')
+def test_variadic_generic_model_multiple_typevartuples_error():
+    Ts1 = TypeVarTuple('Ts1')
+    Ts2 = TypeVarTuple('Ts2')
+
+    with pytest.raises(TypeError, match='multiple TypeVarTuple parameters'):
+
+        class Model(BaseModel, Generic[Unpack[Ts1], Unpack[Ts2]]):
+            pass
 
 
 @pytest.mark.skipif(

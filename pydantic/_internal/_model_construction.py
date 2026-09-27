@@ -19,6 +19,7 @@ from typing_extensions import (
     dataclass_transform,
     deprecated,
 )
+from typing_inspection import typing_objects
 
 from ..errors import PydanticUndefinedAnnotation, PydanticUserError
 from ..plugin._schema_validator import create_schema_validator
@@ -156,6 +157,11 @@ class ModelMetaclass(ABCMeta):
             else:
                 parent_parameters = getattr(cls, '__pydantic_generic_metadata__', {}).get('parameters', ())
                 parameters = getattr(cls, '__parameters__', None) or parent_parameters
+                if sum(typing_objects.is_typevartuple(p) for p in parameters) > 1:
+                    raise TypeError(
+                        f'{cls.__name__} has multiple TypeVarTuple parameters, '
+                        'but only one TypeVarTuple is supported per generic model.'
+                    )
                 if parameters and parent_parameters and not all(x in parameters for x in parent_parameters):
                     from ..root_model import RootModelRootType
 

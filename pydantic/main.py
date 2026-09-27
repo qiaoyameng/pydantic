@@ -984,10 +984,11 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         # For a model `class Model[T, U, V = int](BaseModel): ...` parametrized with `(str, bool)`,
         # this gives us `{T: str, U: bool, V: int}`:
         typevars_map = _generics.map_generic_model_arguments(cls, typevar_values)
-        # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`):
-        typevar_values = tuple(v for v in typevars_map.values())
+        # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`).
+        # `TypeVarTuple` parameters are mapped to a tuple of arguments, which gets spliced into the values:
+        typevar_values = _generics.typevars_map_to_args(typevars_map)
 
-        if _utils.all_identical(typevars_map.keys(), typevars_map.values()) and typevars_map:
+        if _generics.typevars_map_is_identity(typevars_map):
             submodel = cls  # if arguments are equal to parameters it's the same object
             _generics.set_cached_generic_type(cls, typevar_values, submodel)
         else:
