@@ -665,6 +665,8 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         # Any strings received should represent forward references, so we handle them specially below.
         # If we eventually move toward wrapping them in a ForwardRef in __class_getitem__ in the future,
         # we may be able to remove this special case.
+        if not params:
+            return f'{cls.__name__}[()]'
         param_names = [param if isinstance(param, str) else _repr.display_as_type(param) for param in params]
         params_component = ', '.join(param_names)
         return f'{cls.__name__}[{params_component}]'
@@ -985,9 +987,10 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
         # this gives us `{T: str, U: bool, V: int}`:
         typevars_map = _generics.map_generic_model_arguments(cls, typevar_values)
         # We also update the provided args to use defaults values (`(str, bool)` becomes `(str, bool, int)`):
-        typevar_values = tuple(v for v in typevars_map.values())
+        # A `TypeVarTuple` parameter is mapped to a tuple of types, which is flattened here:
+        typevar_values = _generics.flatten_typevars_map_values(typevars_map)
 
-        if _utils.all_identical(typevars_map.keys(), typevars_map.values()) and typevars_map:
+        if typevars_map and _generics.is_identity_parametrization(typevars_map):
             submodel = cls  # if arguments are equal to parameters it's the same object
             _generics.set_cached_generic_type(cls, typevar_values, submodel)
         else:
@@ -995,7 +998,7 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             if not parent_args:
                 args = typevar_values
             else:
-                args = tuple(_generics.replace_types(arg, typevars_map) for arg in parent_args)
+                args = _generics.replace_types_in_args(parent_args, typevars_map)
 
             origin = cls.__pydantic_generic_metadata__['origin'] or cls
             model_name = origin.model_parametrized_name(args)

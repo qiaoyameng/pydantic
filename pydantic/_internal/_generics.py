@@ -194,9 +194,11 @@ def iter_contained_typevars(v: Any) -> Generator[TypeVar]:
     """
     if isinstance(v, TypeVar):
         yield v
+    elif typing_objects.is_typevartuple(v):
+        yield v  # type: ignore
     elif is_model_class(v):
         yield from v.__pydantic_generic_metadata__['parameters']
-    elif isinstance(v, (DictValues, list)):
+    elif isinstance(v, (DictValues, list, tuple)):
         for var in v:
             yield from iter_contained_typevars(var)
     else:
@@ -233,7 +235,27 @@ def get_standard_typevars_map(cls: Any) -> dict[TypeVar, Any] | None:
     # So it is safe to access cls.__args__ and origin.__parameters__
     args: tuple[Any, ...] = cls.__args__  # type: ignore
     parameters: tuple[TypeVar, ...] = origin.__parameters__
-    return dict(zip(parameters, args, strict=True))
+    return _map_parameters_to_args(parameters, args)
+
+
+def _map_parameters_to_args(parameters: tuple[Any, ...], args: tuple[Any, ...]) -> dict[TypeVar, Any]:
+    """Zip generic parameters with their (fully materialized) arguments into a dictionary compatible
+    with the `replace_types` function.
+
+    If one of the parameters is a `TypeVarTuple`, it is mapped to a *tuple* of the arguments it
+    consumes: parameters before it consume arguments from the front, parameters after it consume
+    arguments from the back, and the `TypeVarTuple` consumes the remaining ones in the middle.
+    """
+    tvt_index = next((i for i, p in enumerate(parameters) if typing_objects.is_typevartuple(p)), None)
+    if tvt_index is None:
+        return dict(zip(parameters, args, strict=True))
+
+    back_count = len(parameters) - tvt_index - 1
+    split = len(args) - back_count
+    typevars_map = dict(zip(parameters[:tvt_index], args[:tvt_index], strict=True))
+    typevars_map[parameters[tvt_index]] = tuple(args[tvt_index:split])
+    typevars_map.update(zip(parameters[tvt_index + 1 :], args[split:], strict=True))
+    return typevars_map
 
 
 def get_model_typevars_map(cls: type[BaseModel]) -> dict[TypeVar, Any]:
@@ -251,7 +273,7 @@ def get_model_typevars_map(cls: type[BaseModel]) -> dict[TypeVar, Any]:
     if not args:
         # No need to go into `iter_contained_typevars`:
         return {}
-    return dict(zip(iter_contained_typevars(origin), args, strict=True))
+    return _map_parameters_to_args(tuple(iter_contained_typevars(origin)), args)
 
 
 def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
@@ -259,11 +281,15 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
 
     Args:
         type_: The class or generic alias.
-        type_map: Mapping from `TypeVar` instance to concrete types.
+        type_map: Mapping from `TypeVar` instance to concrete types. `TypeVarTuple` instances
+            can be mapped to a *tuple* of concrete types.
 
     Returns:
         A new type representing the basic structure of `type_` with all
-        `typevar_map` keys recursively replaced.
+        `typevar_map` keys recursively replaced. If `type_` is an unpacked `TypeVarTuple`
+        (i.e. `Unpack[Ts]`) mapped to a tuple of types, a tuple of the replaced types is
+        returned instead; callers are expected to splice it into the surrounding type's
+        arguments (see `replace_types_in_args`).
 
     Example:
         ```python
@@ -279,6 +305,14 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
     type_args = get_args(type_)
     origin_type = get_origin(type_)
 
+    if typing_objects.is_unpack(origin_type):
+        # `Unpack[Ts]`, where `Ts` is a `TypeVarTuple` mapped to a tuple of types:
+        unpacked = type_args[0] if type_args else None
+        if unpacked is not None and unpacked in type_map:
+            mapped = type_map[unpacked]
+            items = mapped if isinstance(mapped, tuple) else (mapped,)
+            return replace_types_in_args(items, type_map)
+
     if typing_objects.is_annotated(origin_type):
         annotated_type, *annotations = type_args
         annotated_type = replace_types(annotated_type, type_map)
@@ -288,7 +322,7 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
     # Having type args is a good indicator that this is a typing special form
     # instance or a generic alias of some sort.
     if type_args:
-        resolved_type_args = tuple(replace_types(arg, type_map) for arg in type_args)
+        resolved_type_args = replace_types_in_args(type_args, type_map)
         if all_identical(type_args, resolved_type_args):
             # If all arguments are the same, there is no need to modify the
             # type or create a new object at all
@@ -333,7 +367,15 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
         parameters = type_.__pydantic_generic_metadata__['parameters']
         if not parameters:
             return type_
-        resolved_type_args = tuple(replace_types(t, type_map) for t in parameters)
+        resolved_args: list[Any] = []
+        for t in parameters:
+            replaced = replace_types(t, type_map)
+            if typing_objects.is_typevartuple(t) and isinstance(replaced, tuple):
+                # A `TypeVarTuple` mapped to a tuple of types consumes a variable number of arguments:
+                resolved_args.extend(replaced)
+            else:
+                resolved_args.append(replaced)
+        resolved_type_args = tuple(resolved_args)
         if all_identical(parameters, resolved_type_args):
             return type_
         return type_[resolved_type_args]
@@ -341,7 +383,7 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
     # Handle special case for typehints that can have lists as arguments.
     # `typing.Callable[[int, str], int]` is an example for this.
     if isinstance(type_, list):
-        resolved_list = [replace_types(element, type_map) for element in type_]
+        resolved_list = list(replace_types_in_args(tuple(type_), type_map))
         if all_identical(type_, resolved_list):
             return type_
         return resolved_list
@@ -349,6 +391,56 @@ def replace_types(type_: Any, type_map: Mapping[TypeVar, Any] | None) -> Any:
     # If all else fails, we try to resolve the type directly and otherwise just
     # return the input with no modifications.
     return type_map.get(type_, type_)
+
+
+def replace_types_in_args(type_args: tuple[Any, ...], type_map: Mapping[TypeVar, Any] | None) -> tuple[Any, ...]:
+    """Apply `replace_types` to each item of a sequence of type arguments.
+
+    Unlike a plain element-wise application, arguments of the form `Unpack[Ts]` (where `Ts`
+    is a `TypeVarTuple` mapped to a tuple of types in `type_map`) are spliced into the
+    resulting tuple, so that e.g. the arguments of `tuple[T, Unpack[Ts]]` are correctly
+    resolved to the arguments of `tuple[int, str, bytes]` when `T` is mapped to `int` and
+    `Ts` is mapped to `(str, bytes)`.
+    """
+    resolved_args: list[Any] = []
+    for arg in type_args:
+        replaced = replace_types(arg, type_map)
+        if isinstance(replaced, tuple) and _typing_extra.unpack_type(arg) is not None:
+            resolved_args.extend(replaced)
+        else:
+            resolved_args.append(replaced)
+    return tuple(resolved_args)
+
+
+def flatten_typevars_map_values(typevars_map: Mapping[TypeVar, Any]) -> tuple[Any, ...]:
+    """Return the flattened type arguments of a parametrization, given the mapping between
+    the parameters of a generic model and the arguments provided during parameterization.
+
+    A `TypeVarTuple` parameter is mapped to a tuple of types, which is flattened here, so
+    that e.g. parametrizing `Model[*Ts]` with `(int, str)` results in `(int, str)`.
+    """
+    return tuple(
+        value
+        for param, mapped in typevars_map.items()
+        for value in (mapped if typing_objects.is_typevartuple(param) else (mapped,))
+    )
+
+
+def is_identity_parametrization(typevars_map: Mapping[TypeVar, Any]) -> bool:
+    """Return whether the parametrization maps every parameter to itself.
+
+    This is the case for e.g. `Model[T]` (or `Model[*Ts]` for variadic models), where
+    no new submodel needs to be created.
+    """
+    for param, value in typevars_map.items():
+        if typing_objects.is_typevartuple(param):
+            if not (
+                isinstance(value, tuple) and len(value) == 1 and _typing_extra.unpack_type(value[0]) is param
+            ):
+                return False
+        elif param is not value:
+            return False
+    return True
 
 
 def map_generic_model_arguments(cls: type[BaseModel], args: tuple[Any, ...]) -> dict[TypeVar, Any]:
@@ -375,6 +467,10 @@ def map_generic_model_arguments(cls: type[BaseModel], args: tuple[Any, ...]) -> 
         This function is analogous to the private `typing._check_generic_specialization` function.
     """
     parameters = cls.__pydantic_generic_metadata__['parameters']
+    tvt_index = next((i for i, p in enumerate(parameters) if typing_objects.is_typevartuple(p)), None)
+    if tvt_index is not None:
+        return _map_variadic_arguments(cls, parameters, tvt_index, args)
+
     expected_len = len(parameters)
     typevars_map: dict[TypeVar, Any] = {}
 
@@ -400,6 +496,69 @@ def map_generic_model_arguments(cls: type[BaseModel], args: tuple[Any, ...]) -> 
         else:
             param = cast(TypeVar, parameter)
             typevars_map[param] = argument
+
+    return typevars_map
+
+
+def _has_default(param: Any) -> bool:
+    try:
+        return param.has_default()  # pyright: ignore[reportAttributeAccessIssue]
+    except AttributeError:
+        # Happens if using `typing.TypeVar` (and not `typing_extensions`) on Python < 3.13.
+        return False
+
+
+def _map_variadic_arguments(
+    cls: type[BaseModel], parameters: tuple[Any, ...], tvt_index: int, args: tuple[Any, ...]
+) -> dict[TypeVar, Any]:
+    """Return a mapping between the parameters of a generic model and the provided arguments,
+    where one of the parameters (at index `tvt_index`) is a `TypeVarTuple`.
+
+    Parameters before the `TypeVarTuple` consume arguments from the front, parameters after
+    it consume arguments from the back, and the `TypeVarTuple` consumes whatever remains in
+    the middle (possibly zero arguments). The `TypeVarTuple` is mapped to a *tuple* of types.
+    """
+    # Pad with a sentinel for parameters with a default that are reached exactly when
+    # the provided arguments run out (mirrors how `typing` handles PEP 696 defaults):
+    use_default = object()
+    padded_args: list[Any] = list(args)
+    for i, param in enumerate(parameters):
+        if not typing_objects.is_typevartuple(param) and i == len(padded_args) and _has_default(param):
+            padded_args.append(use_default)
+
+    back_count = len(parameters) - tvt_index - 1
+    if len(padded_args) < tvt_index + back_count:
+        raise TypeError(
+            f'Too few arguments for {cls}; actual {len(args)}, expected at least {len(parameters) - 1}'
+        )
+
+    split = len(padded_args) - back_count
+    front_args = padded_args[:tvt_index]
+    tvt_args = tuple(padded_args[tvt_index:split])
+    back_args = padded_args[split:]
+
+    tvt_param = parameters[tvt_index]
+    if not tvt_args and _has_default(tvt_param):
+        default = tvt_param.__default__
+        unpacked_default = _typing_extra.unpack_type(default)
+        if unpacked_default is not None:
+            # e.g. `Unpack[tuple[int, str]]`:
+            tvt_args = get_args(unpacked_default) or (unpacked_default,)
+        else:
+            tvt_args = tuple(default) if isinstance(default, tuple) else (default,)
+
+    typevars_map: dict[TypeVar, Any] = {}
+    for param, argument in zip(parameters[:tvt_index], front_args):
+        typevars_map[param] = argument
+    typevars_map[tvt_param] = tvt_args
+    for param, argument in zip(parameters[tvt_index + 1 :], back_args):
+        typevars_map[param] = argument
+
+    # Resolve the defaults, which might refer to other type parameters. For an example, see:
+    # https://typing.python.org/en/latest/spec/generics.html#type-parameters-as-parameters-to-generics
+    for param, argument in list(typevars_map.items()):
+        if argument is use_default:
+            typevars_map[param] = replace_types(param.__default__, typevars_map)  # pyright: ignore[reportAttributeAccessIssue]
 
     return typevars_map
 

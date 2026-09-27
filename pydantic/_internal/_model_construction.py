@@ -34,6 +34,7 @@ from ._fields import (
 )
 from ._generate_schema import GenerateSchema, InvalidSchemaError
 from ._generics import PydanticGenericMetadata, get_model_typevars_map
+from ._typing_extra import parent_frame_namespace
 from ._import_utils import import_cached_base_model, import_cached_field_info
 from ._mock_val_ser import set_model_mocks
 from ._namespace_utils import NsResolver
@@ -156,6 +157,11 @@ class ModelMetaclass(ABCMeta):
             else:
                 parent_parameters = getattr(cls, '__pydantic_generic_metadata__', {}).get('parameters', ())
                 parameters = getattr(cls, '__parameters__', None) or parent_parameters
+                if sum(typing_objects.is_typevartuple(p) for p in parameters) > 1:
+                    raise TypeError(
+                        f'Only one TypeVarTuple can be used in the parameters of {cls.__name__!r}; '
+                        'unpacked TypeVarTuples cannot be combined with each other.'
+                    )
                 if parameters and parent_parameters and not all(x in parameters for x in parent_parameters):
                     from ..root_model import RootModelRootType
 
